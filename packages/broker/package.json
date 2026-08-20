@@ -1,0 +1,35 @@
+{
+  "name": "@opencode-agentbus/broker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "import": "./dist/cli.js",
+      "default": "./dist/cli.js"
+    }
+  },
+  "bin": {
+    "opencode-agentbus-broker": "./dist/cli.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bun ../../scripts/run-package-tsc.ts typecheck",
+    "build": "bun ../../scripts/run-package-tsc.ts build",
+    "start": "bun ./dist/cli.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@opencode-agentbus/protocol": "workspace:0.1.0",
+    "zod": "3.25.76"
+  }
+}

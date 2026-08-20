@@ -1,0 +1,26 @@
+{
+  "name": "@opencode-agentbus/plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bun ../../scripts/run-package-tsc.ts typecheck",
+    "build": "bun ../../scripts/run-package-tsc.ts build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@opencode-agentbus/protocol": "workspace:0.1.0",
+    "@opencode-ai/plugin": "1.18.19"
+  }
+}
