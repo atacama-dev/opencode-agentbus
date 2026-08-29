@@ -1,0 +1,79 @@
+# Requirements
+
+## Scope
+
+OpenCode Agent Bus provides secure, local, asynchronous messaging between opted-in OpenCode sessions owned by one operating-system user. It does not federate across machines or operating-system identities.
+
+## Functional requirements
+
+| ID | Requirement |
+|---|---|
+| FR-01 | The plugin exposes only `agentbus_send`, `agentbus_receive`, `agentbus_search_sessions`, and `agentbus_reply` as model-facing Agent Bus tools. |
+| FR-02 | A sender can enqueue a UTF-8 message for an exact opaque target session with a bounded TTL. A successful body-free receipt identifies the newly sent message for later correlation. |
+| FR-03 | A recipient can inspect body-free pending metadata before disclosure. The body is fetched only after native OpenCode approval. |
+| FR-04 | `once` authorizes one atomic consume. `always` is scoped to the exact authenticated target/source pair. Reject or cancel discloses no body and leaves the message pending. |
+| FR-05 | Approved peer content is returned only as an explicitly untrusted tool result and is never inserted as a user or synthetic message. |
+| FR-06 | Registry search requires native approval before execution and searches only opted-in session metadata, never transcripts or filesystem contents. |
+| FR-07 | Arrival notifications contain only trusted metadata. When explicitly enabled, authoritative pending detection wakes the exact registered target with one compile-time fixed drain instruction containing no peer-controlled content or metadata. |
+| FR-08 | Pending messages are stored durably in SQLite/WAL until atomic delivery, rejection, or expiry. Default TTL is one hour; accepted TTL is 10 seconds through 24 hours. |
+| FR-09 | The plugin defaults to lazy broker autostart and can be configured for manual broker management. Plugin initialization must remain non-blocking. |
+| FR-10 | Autostart authenticates an existing broker first and may launch only the declared bundled broker CLI when the configured loopback endpoint is unused. |
+| FR-11 | The detached broker survives plugin disposal and termination of the OpenCode process that launched it. The plugin never stops, signals, replaces, or takes over a listener. |
+| FR-12 | Concurrent cold starts converge on one authenticated broker. All contention callers poll within their existing startup deadline instead of failing while the winner starts. |
+| FR-13 | A running plugin detects a later broker failure and can relaunch it using the same credential and database. Committed, unexpired pending messages survive `SIGKILL` and remain exactly-once consumable. |
+| FR-14 | Wake delivery coalesces duplicate hints, defers while the target is busy, resumes on idle, bounds retry after host prompt failure, cancels on disposal, and remains latched until authoritative empty state. Every own entry in a successful session-status map must match the compatible `idle`, `busy`, or complete `retry` shape before an omitted exact registered target can mean idle. Explicit target `busy` or `retry` remains non-idle, while malformed containers, malformed target or unrelated entries, and error responses retry fail-safe. The agent must invoke the real `agentbus_receive` tool and drain until `EMPTY`. |
+| FR-15 | When explicitly enabled, a native `agentbus_receive` permission request navigates the TUI to the trusted requesting session and shows fixed long-lived warning text without changing permission status or auto-approving. |
+| FR-16 | `agentbus_reply` accepts the delivered message ID being answered, a UTF-8 body, and an optional bounded TTL. It accepts no target and requires no new disclosure approval because it never reads the original body. |
+| FR-17 | The broker authorizes a reply only when the caller is the original target and the original is retained in `DELIVERED` state, then resolves the original authenticated source as the new target. Missing, foreign, or not-addressed IDs return `MESSAGE_NOT_FOUND`; owned non-delivered originals return `MESSAGE_NOT_REPLYABLE`. |
+| FR-18 | Every reply receives a fresh message ID. Its body-free receipt, pending header, delivered `peer_message`, persisted row, and metadata-only event carry `replyToMessageId` referencing the original. Ordinary messages omit the optional linkage. |
+| FR-19 | Multiple replies to one delivered message are independent ordinary pending messages and use the same size, TTL, rate, pending, durable, persistence, and notification controls as normal sends. |
+| FR-20 | Plugin and broker use application protocol v2 in lockstep. A successful v2 application handshake is required before registration, event recovery, or message operations. Mixed v1/v2 deployments fail closed before registration or body delivery. |
+| FR-21 | A successful send or reply receipt is accepted only when its body hash and UTF-8 byte count match the body submitted by that runtime request. |
+| FR-22 | Every model-facing tool call derives foreground admission authority only from trusted per-call `ToolContext.sessionID`, `directory`, and `worktree`. Before broker readiness, the plugin parses the context ID with `HostSessionIdSchema`, queries sessions for that exact directory, requires exactly one matching session ID with the exact directory, and parses the projected returned ID and metadata with the full strict `ForegroundSessionSchema`. It then requires the session project ID to equal the current project returned for that directory. The trusted `ToolContext.worktree` and trusted current-project worktree are validated independently: both must be absolute and safely contain the exact context directory, but exact equality is not required when one is a legitimate broader root, including global `/`. Invalid-character, control/Unicode-unsafe, empty, oversized, mismatched, malformed-metadata, non-absolute, unrelated, escaping, duplicate, missing, or failed host results stop before authentication, probing, launch, channel creation, admission, or operation. Static plugin directory/project state is background/bootstrap scope only, and model-controlled arguments cannot provide or override any authority field. |
+| FR-23 | At the 256-active-session ceiling, a verified foreground tool session is admitted by atomically displacing background sessions first and then the least-recently foreground-used session. A displaced trusted tool session transparently re-enters on its next call with the same canonical identity. |
+| FR-24 | Foreground identity resolution is non-activating. Durable row creation, source/dependency admission, the requested operation, and the source's authoritative pending snapshot plus principal event high-water occur only in the real operation transaction. Background bootstrap reserves durable capacity below the 1,024-row bound; boundary reclamation is limited to deterministic inactive, state-free background rows. |
+| FR-25 | Pending toasts, session-status queries, fixed wakes, and receive-approval selection/toasts route to the trusted directory associated with the exact host session. Trusted tool context and host lifecycle events may establish or refresh a route; deletion and disposal remove it. Static plugin directory fallback applies only to sessions bootstrapped in that exact workspace, and the side effect is suppressed when no trusted route exists. |
+
+## Security and reliability requirements
+
+| ID | Requirement |
+|---|---|
+| SR-01 | Broker transport binds only to literal loopback and authenticates every client before protected operations. |
+| SR-02 | The plugin verifies a fresh nonce/HMAC broker challenge immediately before every bearer-bearing MCP or SSE request. |
+| SR-03 | Credential, database, and sidecar files fail closed on unsafe ownership, mode, link, or path conditions. |
+| SR-04 | Broker limits cover message size, TTL, rates, active sessions, durable rows, requests, connections, replay windows, and retained terminal state. |
+| SR-05 | Autostart passes a minimal allowlisted child environment and never accepts a model-controlled command, executable, endpoint, credential path, or database path. |
+| SR-06 | An occupied unknown endpoint, insecure credential, malformed configuration, or genuine child startup failure fails closed without listener replacement. |
+| SR-07 | Message consume and reject transitions are transactional, target-bound, hash-bound, and replay-safe. |
+| SR-08 | The product-source auditor permits exactly one AST-structural fixed wake call. Dynamic text, interpolation, peer-derived values, wrong targets, extra parts, `prompt()`, additional `promptAsync` sites, and all unrelated synthetic use fail closed. |
+| SR-09 | Direct-reply routing is broker-authoritative and transactionally resolves only authenticated IDs and message state. The plugin keeps no message-ID-to-source routing map. |
+| SR-10 | Reply lookup does not fetch the original body. Terminal body erasure and later parent-row retention purge do not invalidate an already enqueued reply or its non-foreign-key correlation metadata. |
+| SR-11 | An authenticated detached v1 listener is not reused, signalled, stopped, replaced, or taken over by the v2 plugin, regardless of whether broker autostart is enabled. The operator receives fixed upgrade guidance, while model-facing errors remain canonical and detail-free. Manual mode performs no TCP startup probe or launch after an unavailable authenticated-readiness attempt. |
+| SR-12 | Migration 4 accepts only a canonical schema-v3 database with no `reply_to_message_id` column. Any pre-existing declaration at `user_version = 3` is a noncanonical partial migration and fails before mutation or version advancement. The transactional migration adds nullable `TEXT` itself and validates the resulting non-primary-key, no-default, no-foreign-key shape before advancing to v4. |
+| SR-13 | Pending, consumed, presented, receipt, and event-transitive reply schemas reject self-linkage where `replyToMessageId` equals the new message ID. |
+| SR-14 | Foreground admission, deterministic victim selection, source/dependency protection, and the requested broker operation execute in one SQLite `BEGIN IMMEDIATE` transaction. The active count never exceeds 256, including under concurrent independent plugin clients. |
+| SR-15 | Displacement preserves session rows, canonical identities, metadata, messages, bodies, reply linkage, events, approvals, and TTL state. Background registration and heartbeats neither reclaim a displaced slot nor update foreground recency, and explicit deregistration remains distinct from displacement. |
+| SR-16 | Migration 5 accepts only a canonical v4 sessions table and indexes without `displaced` or `last_foreground_ms`, validating column type/null/default/PK, FK, CHECK, uniqueness, and index shape before mutation. It adds both columns and the deterministic admission index transactionally, validates canonical v5 output before version advancement, validates v5 on reopen, and rolls back on every malformed or partial shape. |
+| SR-17 | Foreground operation and pending-list responses carry an authenticated body-free pending snapshot and principal-scoped event high-water captured in the same broker transaction. Event cursor `0` is the explicit no-prior-event boundary; an absent cursor is never accepted as a live-subscription mode. |
+| SR-18 | Every SSE connection sends the snapshot high-water as `Last-Event-ID`. The broker subscribes to live events before transactionally replaying events strictly after that cursor, buffers events racing replay, and emits each sequence at most once in order. The runtime serializes recovery, buffers duplicate or reordered hints, obtains a post-subscription snapshot when establishing a stream, and publishes only the converged pending count. A stale or invalid cursor returns conflict and requires a fresh authoritative snapshot/high-water before reconnect. |
+| SR-19 | A connected principal stream is not considered recovered until it covers a stable generation of every active local registration. Recovery prefers the saved acknowledged or disconnect cursor, falls back after a stale or absent boundary to authoritative body-free snapshots for all such registrations, and retries when registration addition, removal, or displaced foreground re-entry changes membership during convergence. Broker-displaced owned sessions remain eligible only for body-free pending-list recovery without reactivation; explicitly deregistered or otherwise inactive sessions remain ineligible. |
+| SR-20 | Runtime concurrency is one-way: the ordered SSE ingestion lane performs only schema/principal/session validation, event-ID deduplication, bounded authenticated buffering, and fire-and-forget recovery scheduling. It never awaits pending recovery. The serialized pending-recovery lane exclusively performs authoritative lists, principal convergence, receive list/peek reconciliation, post-terminal refresh, cursor/count application, covered-event drainage, and pending/wake publication, and may await the ingestion barrier before and after fetches. Native receive approval and atomic consume occur only after that lane is released. Buffered per-target events remain until an authoritative cursor covers them; newer events or membership changes force bounded retry without intermediate publication. |
+| SR-21 | Receive ordering uses a lane-owned local pending observation and authenticated current-first-header snapshot because consume, rejection, or expiry may change the inbox without advancing the principal event cursor. A newer semantically matching snapshot may validate an in-flight peek; a conflicting snapshot forces retry or fail-closed behavior. Inactive local registrations do not buffer events, contribute pending wake counts, or reactivate through background recovery. Active-to-inactive transition prunes only that registration's buffered events, and verified foreground re-admission recovers durable pending headers authoritatively. |
+| SR-22 | The trusted host-session route registry is internal, keyed only by exact host session ID, bounded to 256 recency-ordered entries, and contains only trusted directory/worktree routing data. Peer bodies, titles, labels, source metadata, broker envelopes, and model arguments cannot populate or select routes, and filesystem routes never enter model output, permission resources, notification text, wake content, broker envelopes, or logs. |
+
+## Platform and operational requirements
+
+- Linux is required for `/proc/self/fd`, secure file checks, and the abstract Unix socket startup lease.
+- Bun 1.3.9 and the OpenCode 1.18.19 plugin API contract are locked. Full end-to-end product QA used OpenCode 1.18.19; built server-root routing tests use a simulated compatible host API, and compatibility tests cover the sparse session-status response observed on installed OpenCode 1.18.23. The opt-in real-server attached-client wake, TUI navigation, and approval-flow QA on 1.18.23 remains outstanding.
+- Broker state defaults to `~/.local/state/opencode-agentbus/broker.sqlite` and `~/.config/opencode-agentbus/credential.json`.
+- Persistence recovery requires the same database and credential. Messages that pass their absolute TTL while the broker is stopped expire on recovery.
+- Protocol-v2 upgrades require the plugin and bundled broker packages to be upgraded together and any still-running detached v1 broker to be stopped manually before the v2 broker starts. The v2 broker then performs the ordered schema v3→v4→v5 migrations.
+
+## Non-goals
+
+- Transcript-content search
+- Cross-server or cross-user federation
+- Automatic execution of peer requests
+- Automatic replies
+- Peer content injection into OpenCode history
+- Persistent native `always` grants across OpenCode restarts
