@@ -2,14 +2,14 @@
 
 ## Result
 
-Original messaging flow approved on 2026-08-20. Plugin-managed broker lifecycle approved on 2026-08-21. The direct-reply, bounded foreground-admission, principal-wide causal-recovery, and trusted attached-workspace routing increments are implemented and covered by automated protocol, broker, plugin, built integration, migration, restart, and package-smoke tests.
+Original messaging flow approved on 2026-08-20. Plugin-managed broker lifecycle approved on 2026-08-21. The direct-reply, bounded foreground-admission, configurable active-session-capacity, principal-wide causal-recovery, and trusted attached-workspace routing increments are implemented and covered by automated protocol, broker, plugin, built integration, migration, restart, and package-smoke tests.
 
 ## Automated gates
 
-- 456 unit tests (1,936 assertions) passed; one wrong-owner database test was skipped because execution was non-root.
-- 24 integration scenarios (246 assertions) passed using the built plugin, production MCP SDK channel, live broker, SQLite/WAL, SSE, independent plugin clients, detached subprocesses, and a compatible simulated OpenCode host API for server-root/attached-workspace routing.
+- 467 unit tests (2,217 assertions) passed; one wrong-owner database test was skipped because execution was non-root.
+- 27 integration scenarios (260 assertions) passed using the built plugin, production MCP SDK channel, live broker, SQLite/WAL, SSE, independent plugin clients, detached subprocesses, and a compatible simulated OpenCode host API for server-root/attached-workspace routing.
 - Strict typecheck, dependency-ordered builds, lint, format, package smoke, dependency audit, and static plugin audit passed.
-- Unit coverage was 92.66% lines and 87.67% functions.
+- Unit coverage was 92.79% lines and 87.78% functions.
 - A source-only clean-room checkout passed frozen install and the full deterministic gate.
 
 ## Actual OpenCode 1.18.19
@@ -112,8 +112,9 @@ Automated coverage validates:
 
 Automated coverage validates:
 
-- more than 256 sessions across two independently instantiated built plugin/workspace clients sharing one authenticated broker principal;
-- concurrent trusted foreground searches at saturation complete while the persisted active count remains exactly 256;
+- 300 sessions aggregate across two independently instantiated built plugin/workspace clients sharing one authenticated broker principal, with all 300 active and none displaced;
+- the functional minimum of 2 completes built search → send → approved receive → broker-authoritative reply → approved return delivery, never exceeds 2 active sessions, and deterministically displaces the unprotected background session;
+- trusted foreground operations at a configured small limit of 8 complete while deterministic displacement keeps the persisted active count exactly 8;
 - non-activating foreground identity resolution leaves durable and active counts unchanged, and reconnect resolves identity immediately before the real operation rather than registering it first;
 - independent workspaces reach a configured durable-row boundary, preserve the foreground reserve, reclaim one deterministic state-free background row, and remain within both durable and active bounds;
 - all four tools parse trusted per-call `ToolContext.sessionID` with `HostSessionIdSchema`, parse the exact returned registration with strict `ForegroundSessionSchema`, and complete exact-directory/session/project checks before broker readiness or runtime work;
@@ -131,6 +132,29 @@ Automated coverage validates:
 - background registration and heartbeat activity does not steal foreground capacity or trigger channel reconnect loops; and
 - a restart at saturation recovers pending state from a non-receive foreground operation before exactly-once receive, while an event racing the operation snapshot triggers a post-snapshot recovery; and
 - fresh schema v5, canonical v4→v5 migration, persisted recency after restart, partial-migration rejection, malformed v4 type/null/default/PK/FK/CHECK/unique/index fixtures, rollback, and malformed-v5 reopen rejection are covered.
+
+## Configurable active-session capacity
+
+Automated coverage validates:
+
+- the strict trusted plugin configuration defaults to 4096, accepts integer boundaries 2 and 16384, and rejects zero, one, negatives, fractions, `NaN`, strings, whitespace-padded strings, and values above the hard maximum;
+- the manual broker CLI independently defaults to 4096 and rejects empty, signed, leading-zero, whitespace, fractional, exponent, non-numeric, zero, one, negative, and above-maximum environment values;
+- an inherited `OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL` does not override trusted plugin configuration, while autostart passes the exact parsed trusted option explicitly through the otherwise minimal child environment;
+- the default broker quotas are 4096 active, 16384 durable per principal, 65536 durable globally, 4096 foreground reserve, and 4096 registrations per principal per minute;
+- minimum, 300-session, and hard-maximum configurations derive coherent 4× per-principal and 16× global durable bounds, equal foreground reserve, and a registration budget of `max(256, active limit)`;
+- active capacity above 16384 and derived durable, global, reserve, or registration quotas above 65536, 262144, 16384, and 16384 respectively fail closed;
+- 300 direct registrations stay active without durable or registration accounting causing premature displacement, and 300 bootstrapped sessions across two workspaces remain active through a foreground search;
+- protocol-v2 pending-event bindings accept more than the historical 256-session ceiling while remaining bounded by the 16384 hard maximum;
+- the default store admits all 4096 active sessions in the ordinary unit suite without displacement, durable-cap exhaustion, or registration-rate exhaustion;
+- authentication challenges derive as `4A + 256`: 16640 at the default and a finite maximum of 65792, while an actual 256-session lifecycle burst of `4A + 6` challenges remains below its derived 1280 budget and explicit smaller limiter overrides still rate-limit and refill deterministically;
+- each active session's 120-second lease schedules its steady heartbeat every 60 seconds, and every authenticated MCP/heartbeat and SSE-opening request performs a fresh challenge, accounting for the active-sized heartbeat share of the formula;
+- active-session and concurrent transport capacities are separate finite bounds: `W = ceil(4096 / 256) = 16` is the default dense-workspace estimate, four operational slots yield 20 MCP and 20 SSE connections per principal, and each transport is independently capped at 40 globally; sparse one-session workspaces may reach transport capacity before 4096 active sessions;
+- deterministic lower-level server admission tests accept exactly 20 MCP sessions and 20 SSE streams for one principal, reject the 21st, accept exactly 40 of each across distinct test principals, reject the 41st globally, release one connection, accept its replacement, and clean every connection back to zero;
+- MCP and SSE policy ceilings remain finite at 68 per principal and 136 globally at the hard active maximum, with invalid, above-maximum, and per-principal-above-global overrides rejected;
+- a live lower-level server accepts and cleans nine simultaneous SSE streams under derived defaults, and a built integration sustains nine independent workspace runtimes with nine MCP sessions and nine SSE streams;
+- plugin lifecycle membership and trusted session routes remain capped at 256 per runtime, evicting/deregistering the oldest local membership rather than creating a single 4096-session runtime map;
+- all four model tool schemas and outputs omit the trusted capacity setting; and
+- installed-package smoke verifies exact configured propagation and excludes cloud credentials and runtime injection variables from the broker child environment.
 
 ## Causal foreground recovery increment
 

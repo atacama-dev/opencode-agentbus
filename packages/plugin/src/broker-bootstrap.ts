@@ -29,6 +29,7 @@ export interface BrokerListenAddress {
 export interface BundledBrokerLaunchInput extends BrokerListenAddress {
   readonly credentialFilePath: string;
   readonly environment: TrustedEnvironment;
+  readonly maxActiveSessionsPerPrincipal: number;
 }
 
 export interface SpawnedBrokerProcess {
@@ -100,6 +101,9 @@ export function brokerChildEnvironment(
     ...inheritedBrokerEnvironment(input.environment),
     OPENCODE_AGENTBUS_CREDENTIAL_FILE: input.credentialFilePath,
     OPENCODE_AGENTBUS_HOST: input.hostname,
+    OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: String(
+      input.maxActiveSessionsPerPrincipal,
+    ),
     OPENCODE_AGENTBUS_PORT: String(input.port),
   };
 }
@@ -213,6 +217,7 @@ export class BrokerBootstrap {
         ...this.address,
         credentialFilePath: this.config.credentialFilePath,
         environment: inheritedBrokerEnvironment(this.dependencies.environment),
+        maxActiveSessionsPerPrincipal: this.config.maxActiveSessionsPerPrincipal,
       });
     }
 

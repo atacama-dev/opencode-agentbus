@@ -64,6 +64,7 @@ Defaults:
 | Endpoint | `http://127.0.0.1:4097` |
 | Database | `~/.local/state/opencode-agentbus/broker.sqlite` |
 | Credential | `~/.config/opencode-agentbus/credential.json` |
+| Active sessions per principal | `4096` |
 
 Optional broker environment variables:
 
@@ -71,8 +72,9 @@ Optional broker environment variables:
 - `OPENCODE_AGENTBUS_PORT`
 - `OPENCODE_AGENTBUS_DB_PATH` — absolute path
 - `OPENCODE_AGENTBUS_CREDENTIAL_FILE` — absolute path
+- `OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL` — canonical integer from 2 through 16384; default 4096
 
-The broker creates the database and 256-bit credential using owner-only permissions. It runs as a detached user process and survives plugin disposal or termination of the OpenCode process that launched it.
+The broker creates the database and 256-bit credential using owner-only permissions. It runs as a detached user process and survives plugin disposal or termination of the OpenCode process that launched it. The environment capacity setting is the manual CLI contract. A broker already running keeps the capacity selected when it started; changing this value requires the operator to restart that detached broker manually.
 
 ### Protocol-v2 upgrade
 
@@ -98,6 +100,7 @@ Use the absolute built plugin path and credential path:
         "timeoutMs": 5000,
         "autoStartBroker": true,
         "brokerStartupTimeoutMs": 5000,
+        "maxActiveSessionsPerPrincipal": 4096,
         "wakeOnMessage": true,
         "focusOnReceiveApproval": true
       }
@@ -120,6 +123,26 @@ Alternatively, provide trusted plugin configuration through:
 - `OPENCODE_AGENTBUS_WAKE_ON_MESSAGE` — fixed trusted recipient wake; `false` by default
 - `OPENCODE_AGENTBUS_FOCUS_ON_RECEIVE_APPROVAL` — focus the exact requesting session and show a fixed warning toast; `false` by default
 
+`maxActiveSessionsPerPrincipal` is a trusted plugin option, not a model tool argument or plugin-environment override. It accepts only an integer from 2 through 16384 and defaults to 4096. Two is the functional minimum because a two-party search/send/reply operation must protect both its foreground source and dependency. Autostart passes that exact parsed value to the bundled broker through its minimal child environment; an arbitrary inherited `OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL` is ignored. If the plugin authenticates an already-running detached broker, it does not replace or restart it, so the existing process keeps its prior capacity until a manual restart.
+
+The broker derives all session-related and transport capacity from the same parsed active limit `A`, whether it was started manually or by plugin autostart:
+
+| Limit | Formula | Default (`A = 4096`) | Hard maximum (`A = 16384`) |
+|---|---:|---:|---:|
+| Durable sessions per principal | `4 × A` | 16384 | 65536 |
+| Durable sessions globally | `16 × A` | 65536 | 262144 |
+| Foreground durable reserve | `A` | 4096 | 16384 |
+| Registrations per principal/minute | `max(256, A)` | 4096 | 16384 |
+| Authentication challenges/minute | `4 × A + 256` | 16640 | 65792 |
+| Expected densely populated workspace topology `W` | `ceil(A / 256)` | 16 | 64 |
+| MCP sessions per principal | `ceil(A / 256) + 4` | 20 | 68 |
+| SSE streams per principal | `ceil(A / 256) + 4` | 20 | 68 |
+| MCP or SSE global ceiling, each | `2 × (ceil(A / 256) + 4)` | 40 | 136 |
+
+Every authenticated MCP request, including each session heartbeat, performs a fresh challenge. With the default 120-second lease, an active session schedules one heartbeat per minute. The challenge formula reserves one active-sized share each for cold registration, steady heartbeat, normal operation/recovery, and reconnect/burst work, plus one 256-request workspace-startup headroom. The challenge endpoint remains locally bound and rate-limited.
+
+Active-session capacity and concurrent workspace-runtime transport capacity are separate finite bounds. `W = ceil(A / 256)` is the expected topology when workspace runtimes are densely populated with their maximum 256 sessions, not a promise that `A` one-session workspaces can connect concurrently. At the default, 16 expected dense workspace runtimes plus 4 reconnect/overlap slots permit exactly 20 concurrent MCP sessions and 20 concurrent SSE streams per principal; each transport has its own independent global ceiling of 40. Sparse one-session workspaces can therefore reach the 20-runtime transport ceiling well before reaching 4096 active sessions. At the active hard maximum the corresponding transport ceilings remain 68 per principal and 136 globally for each transport.
+
 Restart OpenCode after changing plugin configuration. Do not use OpenCode auto-approval if a physical user must approve messages.
 
 Both visibility options default to `false`. When `wakeOnMessage` is enabled, authoritative pending detection sends one fixed synthetic instruction to the exact registered host session. The instruction contains no message body, title, source, hash, broker metadata, or peer-controlled text and tells the agent to call the real `agentbus_receive` tool until it returns `EMPTY`. Duplicate hints are coalesced, an unknown initial activity state is resolved through the trusted session-status API, busy sessions wait for an idle event, and receive attempts keep the same pending state latched. OpenCode 1.18.23 returns a sparse successful status map: after every own map entry has been validated against the compatible `idle`, `busy`, or `retry` shape, an already registered target omitted from that map is idle. Explicit target `busy` or `retry` remains non-idle. Error, malformed-entry, or malformed-container responses fail safe and retry instead of assuming idle. A successful wake starts a 30-second per-recipient cooldown for later rearmed pending states; it never delays an agent that is already draining the inbox with the real receive tool.
@@ -128,7 +151,7 @@ When `focusOnReceiveApproval` is enabled, an `agentbus_receive` native permissio
 
 In server mode, the directory captured when the plugin starts is bootstrap scope, not foreground authority or a universal UI route. Exact per-call host validation populates a bounded per-session route map; trusted lifecycle events refresh it, deletion removes it, and plugin disposal clears it. The static startup directory is used only as a fallback for sessions bootstrapped in that exact workspace. If no trusted route exists, the plugin suppresses the corresponding toast, status query, wake, or focus action.
 
-Installing the plugin for a project opts in up to 256 newest sessions returned by OpenCode for that project/directory. Session titles are searchable metadata; transcripts and filesystem paths are never indexed.
+Installing the plugin for a project opts in up to 256 newest sessions returned by OpenCode for that one project/directory. This per-workspace bootstrap and trusted-route bound is distinct from both broker active-session capacity and transport topology. Multiple densely populated plugin workspaces can aggregate beyond 256 toward the configured active limit while remaining within the independent MCP/SSE ceilings; sparse workspaces may hit transport capacity first. Each runtime's session membership and trusted route map remains capped at 256, so a densely populated default topology uses 16 bounded workspace runtimes rather than one 4096-entry runtime scan. Session titles are searchable metadata; transcripts and filesystem paths are never indexed.
 
 ## Verify
 

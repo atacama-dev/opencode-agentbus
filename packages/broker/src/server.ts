@@ -9,9 +9,12 @@ import {
   AuthChallengeRequestSchema,
   ERROR_MESSAGES,
   EVENT_STREAM_REPLAY_CONTRACT,
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  MAX_BOOTSTRAP_SESSIONS_PER_WORKSPACE,
   MCP_HTTP_CONTRACT,
   MCP_INITIALIZATION_CONTRACT,
   METHODS,
+  MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
   McpJsonRpcRequestSchema,
   PENDING_MESSAGE_EVENT_TYPE,
   RequestIdSchema,
@@ -36,11 +39,117 @@ const DEFAULT_EVENT_HEARTBEAT_MS = 15_000;
 const DEFAULT_MCP_SESSION_IDLE_MS = 5 * 60 * 1_000;
 const DEFAULT_MCP_REAP_INTERVAL_MS = 30_000;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 30_000;
-const DEFAULT_MAX_MCP_SESSIONS_PER_PRINCIPAL = 32;
-const DEFAULT_MAX_SSE_CONNECTIONS_PER_PRINCIPAL = 8;
 const DEFAULT_MAX_SSE_BUFFERED_BYTES = 64 * 1_024;
-const DEFAULT_MAX_AUTH_CHALLENGES_PER_MINUTE = 4_096;
 const MAX_HTTP_BODY_BYTES = 128 * 1024;
+const AUTH_CHALLENGES_PER_ACTIVE_SESSION = 4;
+const AUTH_CHALLENGE_FIXED_HEADROOM = MAX_BOOTSTRAP_SESSIONS_PER_WORKSPACE;
+const TRANSPORT_OPERATIONAL_HEADROOM = 4;
+const GLOBAL_CONNECTION_MULTIPLIER = 2;
+const MAX_WORKSPACE_RUNTIMES = Math.ceil(
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL / MAX_BOOTSTRAP_SESSIONS_PER_WORKSPACE,
+);
+const MAX_CONNECTIONS_PER_PRINCIPAL = MAX_WORKSPACE_RUNTIMES + TRANSPORT_OPERATIONAL_HEADROOM;
+const MAX_CONNECTIONS_GLOBAL = MAX_CONNECTIONS_PER_PRINCIPAL * GLOBAL_CONNECTION_MULTIPLIER;
+const MAX_AUTH_CHALLENGES_PER_MINUTE =
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL * AUTH_CHALLENGES_PER_ACTIVE_SESSION +
+  AUTH_CHALLENGE_FIXED_HEADROOM;
+
+export const BROKER_DAEMON_CAPACITY_POLICY = Object.freeze({
+  authChallengesPerActiveSession: AUTH_CHALLENGES_PER_ACTIVE_SESSION,
+  authChallengeFixedHeadroom: AUTH_CHALLENGE_FIXED_HEADROOM,
+  bootstrapSessionsPerWorkspace: MAX_BOOTSTRAP_SESSIONS_PER_WORKSPACE,
+  transportOperationalHeadroom: TRANSPORT_OPERATIONAL_HEADROOM,
+  globalConnectionMultiplier: GLOBAL_CONNECTION_MULTIPLIER,
+  maxAuthChallengesPerMinute: MAX_AUTH_CHALLENGES_PER_MINUTE,
+  maxMcpSessionsPerPrincipal: MAX_CONNECTIONS_PER_PRINCIPAL,
+  maxMcpSessionsGlobal: MAX_CONNECTIONS_GLOBAL,
+  maxSseConnectionsPerPrincipal: MAX_CONNECTIONS_PER_PRINCIPAL,
+  maxSseConnectionsGlobal: MAX_CONNECTIONS_GLOBAL,
+});
+
+export interface BrokerDaemonCapacityLimits {
+  readonly maxAuthChallengesPerMinute: number;
+  readonly maxMcpSessionsPerPrincipal: number;
+  readonly maxMcpSessionsGlobal: number;
+  readonly maxSseConnectionsPerPrincipal: number;
+  readonly maxSseConnectionsGlobal: number;
+}
+
+function checkedCapacityScale(value: number, factor: number, hardMaximum: number): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    !Number.isSafeInteger(factor) ||
+    factor < 1 ||
+    value > Math.floor(hardMaximum / factor)
+  ) {
+    throw new TypeError("Broker daemon capacity derivation is unsafe.");
+  }
+  const scaled = value * factor;
+  if (!Number.isSafeInteger(scaled) || scaled > hardMaximum) {
+    throw new TypeError("Broker daemon capacity derivation is unsafe.");
+  }
+  return scaled;
+}
+
+function checkedCapacityAdd(value: number, increment: number, hardMaximum: number): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    !Number.isSafeInteger(increment) ||
+    increment < 0 ||
+    value > hardMaximum - increment
+  ) {
+    throw new TypeError("Broker daemon capacity derivation is unsafe.");
+  }
+  const sum = value + increment;
+  if (!Number.isSafeInteger(sum) || sum > hardMaximum) {
+    throw new TypeError("Broker daemon capacity derivation is unsafe.");
+  }
+  return sum;
+}
+
+export function deriveBrokerDaemonCapacityLimits(
+  maxActiveSessionsPerPrincipal: number,
+): BrokerDaemonCapacityLimits {
+  if (
+    !Number.isSafeInteger(maxActiveSessionsPerPrincipal) ||
+    maxActiveSessionsPerPrincipal < MIN_ACTIVE_SESSIONS_PER_PRINCIPAL ||
+    maxActiveSessionsPerPrincipal > MAX_ACTIVE_SESSIONS_PER_PRINCIPAL
+  ) {
+    throw new TypeError("Active-session limit exceeds the protocol range.");
+  }
+  const scaledChallenges = checkedCapacityScale(
+    maxActiveSessionsPerPrincipal,
+    AUTH_CHALLENGES_PER_ACTIVE_SESSION,
+    MAX_AUTH_CHALLENGES_PER_MINUTE,
+  );
+  const maxAuthChallengesPerMinute = checkedCapacityAdd(
+    scaledChallenges,
+    AUTH_CHALLENGE_FIXED_HEADROOM,
+    MAX_AUTH_CHALLENGES_PER_MINUTE,
+  );
+  const workspaceRuntimes = Math.ceil(
+    maxActiveSessionsPerPrincipal / MAX_BOOTSTRAP_SESSIONS_PER_WORKSPACE,
+  );
+  const maxConnectionsPerPrincipal = checkedCapacityAdd(
+    workspaceRuntimes,
+    TRANSPORT_OPERATIONAL_HEADROOM,
+    MAX_CONNECTIONS_PER_PRINCIPAL,
+  );
+  const maxConnectionsGlobal = checkedCapacityScale(
+    maxConnectionsPerPrincipal,
+    GLOBAL_CONNECTION_MULTIPLIER,
+    MAX_CONNECTIONS_GLOBAL,
+  );
+  return {
+    maxAuthChallengesPerMinute,
+    maxMcpSessionsPerPrincipal: maxConnectionsPerPrincipal,
+    maxMcpSessionsGlobal: maxConnectionsGlobal,
+    maxSseConnectionsPerPrincipal: maxConnectionsPerPrincipal,
+    maxSseConnectionsGlobal: maxConnectionsGlobal,
+  };
+}
 
 interface McpContext {
   readonly principal: AuthenticatedClientPrincipal;
@@ -66,7 +175,9 @@ export interface BrokerDaemonOptions {
   readonly eventHeartbeatMs?: number;
   readonly clock?: Clock;
   readonly maxMcpSessionsPerPrincipal?: number;
+  readonly maxMcpSessionsGlobal?: number;
   readonly maxSseConnectionsPerPrincipal?: number;
+  readonly maxSseConnectionsGlobal?: number;
   readonly maxSseBufferedBytes?: number;
   readonly mcpSessionIdleMs?: number;
   readonly mcpReapIntervalMs?: number;
@@ -161,7 +272,7 @@ function validateHeartbeat(milliseconds: number): number {
 }
 
 function validatePositiveInteger(value: number, kind: string, maximum: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > maximum) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new TypeError(`${kind} is invalid.`);
   }
   return value;
@@ -174,7 +285,9 @@ export class BrokerDaemon {
   private readonly eventHeartbeatMs: number;
   private readonly clock: Clock;
   private readonly maxMcpSessionsPerPrincipal: number;
+  private readonly maxMcpSessionsGlobal: number;
   private readonly maxSseConnectionsPerPrincipal: number;
+  private readonly maxSseConnectionsGlobal: number;
   private readonly maxSseBufferedBytes: number;
   private readonly mcpSessionIdleMs: number;
   private readonly mcpReapIntervalMs: number;
@@ -200,16 +313,37 @@ export class BrokerDaemon {
       options.eventHeartbeatMs ?? DEFAULT_EVENT_HEARTBEAT_MS,
     );
     this.clock = options.clock ?? { now: () => Date.now() };
+    const capacityDefaults = deriveBrokerDaemonCapacityLimits(
+      this.service.limits.maxActiveSessionsPerPrincipal,
+    );
     this.maxMcpSessionsPerPrincipal = validatePositiveInteger(
-      options.maxMcpSessionsPerPrincipal ?? DEFAULT_MAX_MCP_SESSIONS_PER_PRINCIPAL,
+      options.maxMcpSessionsPerPrincipal ?? capacityDefaults.maxMcpSessionsPerPrincipal,
       "MCP session limit",
-      256,
+      BROKER_DAEMON_CAPACITY_POLICY.maxMcpSessionsPerPrincipal,
+    );
+    this.maxMcpSessionsGlobal = validatePositiveInteger(
+      options.maxMcpSessionsGlobal ??
+        Math.max(capacityDefaults.maxMcpSessionsGlobal, this.maxMcpSessionsPerPrincipal),
+      "Global MCP session limit",
+      BROKER_DAEMON_CAPACITY_POLICY.maxMcpSessionsGlobal,
     );
     this.maxSseConnectionsPerPrincipal = validatePositiveInteger(
-      options.maxSseConnectionsPerPrincipal ?? DEFAULT_MAX_SSE_CONNECTIONS_PER_PRINCIPAL,
+      options.maxSseConnectionsPerPrincipal ?? capacityDefaults.maxSseConnectionsPerPrincipal,
       "SSE connection limit",
-      256,
+      BROKER_DAEMON_CAPACITY_POLICY.maxSseConnectionsPerPrincipal,
     );
+    this.maxSseConnectionsGlobal = validatePositiveInteger(
+      options.maxSseConnectionsGlobal ??
+        Math.max(capacityDefaults.maxSseConnectionsGlobal, this.maxSseConnectionsPerPrincipal),
+      "Global SSE connection limit",
+      BROKER_DAEMON_CAPACITY_POLICY.maxSseConnectionsGlobal,
+    );
+    if (
+      this.maxMcpSessionsPerPrincipal > this.maxMcpSessionsGlobal ||
+      this.maxSseConnectionsPerPrincipal > this.maxSseConnectionsGlobal
+    ) {
+      throw new TypeError("Broker daemon connection limits are inconsistent.");
+    }
     this.maxSseBufferedBytes = validatePositiveInteger(
       options.maxSseBufferedBytes ?? DEFAULT_MAX_SSE_BUFFERED_BYTES,
       "SSE buffer limit",
@@ -231,9 +365,9 @@ export class BrokerDaemon {
       60 * 60 * 1_000,
     );
     this.maxAuthChallengesPerMinute = validatePositiveInteger(
-      options.maxAuthChallengesPerMinute ?? DEFAULT_MAX_AUTH_CHALLENGES_PER_MINUTE,
+      options.maxAuthChallengesPerMinute ?? capacityDefaults.maxAuthChallengesPerMinute,
       "Authentication challenge rate limit",
-      10_000,
+      BROKER_DAEMON_CAPACITY_POLICY.maxAuthChallengesPerMinute,
     );
     this.authChallengeTokens = this.maxAuthChallengesPerMinute;
     this.authChallengeLastRefillMs = this.clock.now();
@@ -460,7 +594,10 @@ export class BrokerDaemon {
       if (request.method === "DELETE") {
         return jsonRpcError(400, -32600, "MCP session header is required.");
       }
-      if (this.mcpCountForPrincipal(principal) >= this.maxMcpSessionsPerPrincipal) {
+      if (
+        this.mcpContexts.size >= this.maxMcpSessionsGlobal ||
+        this.mcpCountForPrincipal(principal) >= this.maxMcpSessionsPerPrincipal
+      ) {
         return jsonRpcError(429, -32000, "Connection limit exceeded.");
       }
       transient = true;
@@ -596,7 +733,12 @@ export class BrokerDaemon {
     const principalConnections = [...this.eventConnections].filter((connection) =>
       principalsEqual(connection.principal, principal),
     ).length;
-    if (principalConnections >= this.maxSseConnectionsPerPrincipal) return plainError(429);
+    if (
+      this.eventConnections.size >= this.maxSseConnectionsGlobal ||
+      principalConnections >= this.maxSseConnectionsPerPrincipal
+    ) {
+      return plainError(429);
+    }
 
     const pendingLiveEvents: PendingMessageEvent[] = [];
     let deliver: (event: PendingMessageEvent) => void = (event) => {

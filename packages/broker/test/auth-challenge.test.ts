@@ -8,12 +8,15 @@ import {
   AuthChallengeNonceSchema,
   AuthChallengeResponseSchema,
   CredentialFileSchema,
-  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   verifyAuthChallengeResponse,
   type AuthChallengeNonce,
   type CredentialFile,
 } from "@opencode-agentbus/protocol";
-import { BrokerDaemon } from "../src/server";
+import {
+  BROKER_DAEMON_CAPACITY_POLICY,
+  BrokerDaemon,
+  deriveBrokerDaemonCapacityLimits,
+} from "../src/server";
 import { createHarness, type Harness } from "./helpers";
 
 function nonce(byte: number): AuthChallengeNonce {
@@ -281,8 +284,9 @@ describe("public authentication challenge", () => {
     expect((await requestChallenge(endpoint, nonce(0xb4))).status).toBe(200);
   });
 
-  test("supports a complete 256-session startup and immediate-dispose challenge budget", async () => {
-    harness = createHarness();
+  test("derives a bounded lifecycle challenge budget from configured capacity", async () => {
+    const activeSessionCapacity = BROKER_DAEMON_CAPACITY_POLICY.bootstrapSessionsPerWorkspace;
+    harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: activeSessionCapacity } });
     daemon = new BrokerDaemon({
       service: harness.service,
       hostname: "127.0.0.1",
@@ -290,7 +294,9 @@ describe("public authentication challenge", () => {
       clock: harness.clock,
     });
     const endpoint = await daemon.start();
-    const lifecycleChallengeCount = MAX_ACTIVE_SESSIONS_PER_PRINCIPAL * 4 + 6;
+    const lifecycleChallengeCount = activeSessionCapacity * 4 + 6;
+    const expectedCapacity =
+      deriveBrokerDaemonCapacityLimits(activeSessionCapacity).maxAuthChallengesPerMinute;
     const statuses = new Set<number>();
 
     for (let index = 0; index < lifecycleChallengeCount; index += 1) {
@@ -299,11 +305,11 @@ describe("public authentication challenge", () => {
       await response.arrayBuffer();
     }
 
-    expect(lifecycleChallengeCount).toBe(1_030);
+    expect(lifecycleChallengeCount).toBeLessThanOrEqual(expectedCapacity);
     expect(statuses).toEqual(new Set([200]));
     expect(daemon.authChallengeRateStateForTesting()).toEqual({
-      capacity: 4_096,
-      availableTokens: 4_096 - lifecycleChallengeCount,
+      capacity: expectedCapacity,
+      availableTokens: expectedCapacity - lifecycleChallengeCount,
     });
   });
 

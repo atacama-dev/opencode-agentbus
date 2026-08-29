@@ -177,7 +177,7 @@ function searchRequest(requester: SessionIdentity, hostSessionId: string, query 
 
 describe("broker-authoritative foreground admission", () => {
   test("resolves a canonical foreground identity without creating a row or consuming an active slot", () => {
-    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 1 } });
+    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 2 } });
     try {
       const before = harness.service.storageStatsForTesting();
       const resolved = expectSuccess<ForegroundIdentityResult>(
@@ -558,13 +558,16 @@ describe("broker-authoritative foreground admission", () => {
   });
 
   test("accepts repeated heartbeats from a displaced background session without reactivation", () => {
-    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 1 } });
+    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 2 } });
     try {
       const background = expectSuccess<RegistrationResult>(
         harness.service.dispatch(
           harness.service.principal,
           registerRequest("heartbeat-background"),
         ),
+      );
+      expectSuccess(
+        harness.service.dispatch(harness.service.principal, registerRequest("heartbeat-keeper")),
       );
       const foregroundIdentity = expectSuccess<RegistrationResult>(
         harness.service.dispatch(
@@ -587,7 +590,10 @@ describe("broker-authoritative foreground admission", () => {
           ),
         );
       }
-      expect(activeHosts(harness.databasePath)).toEqual(["heartbeat-foreground"]);
+      expect(activeHosts(harness.databasePath)).toEqual([
+        "heartbeat-foreground",
+        "heartbeat-keeper",
+      ]);
       expect(harness.service.storageStatsForTesting().displacedSessions).toBe(1);
     } finally {
       harness.close();

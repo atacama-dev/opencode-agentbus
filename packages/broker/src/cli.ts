@@ -2,7 +2,12 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { BROKER_CLI_EXIT_CODES } from "@opencode-agentbus/protocol";
+import {
+  BROKER_CLI_EXIT_CODES,
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
+} from "@opencode-agentbus/protocol";
 import { BrokerLeaseContentionError, acquireBrokerProcessLease } from "./process-lease";
 import { BrokerDaemon, BROKER_DEFAULTS, validateListenHost } from "./server";
 import { BrokerService, type BrokerLogger } from "./service";
@@ -11,6 +16,7 @@ export interface BrokerEnvironmentConfig {
   readonly databasePath: string;
   readonly credentialFilePath: string;
   readonly hostname: "127.0.0.1" | "::1";
+  readonly maxActiveSessionsPerPrincipal: number;
   readonly port: number;
 }
 
@@ -32,6 +38,18 @@ function configuredPort(value: string | undefined): number {
   const port = Number(value);
   if (port > 65_535) throw new TypeError("Broker port is invalid.");
   return port;
+}
+
+function configuredActiveSessionLimit(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL;
+  if (!/^[1-9][0-9]{0,4}$/.test(value)) {
+    throw new TypeError("Broker active-session limit is invalid.");
+  }
+  const limit = Number(value);
+  if (limit < MIN_ACTIVE_SESSIONS_PER_PRINCIPAL || limit > MAX_ACTIVE_SESSIONS_PER_PRINCIPAL) {
+    throw new TypeError("Broker active-session limit is invalid.");
+  }
+  return limit;
 }
 
 function configuredPath(value: string, kind: string): string {
@@ -62,6 +80,9 @@ export function parseBrokerEnvironment(
       "Credential",
     ),
     hostname: validateListenHost(environment.OPENCODE_AGENTBUS_HOST ?? BROKER_DEFAULTS.hostname),
+    maxActiveSessionsPerPrincipal: configuredActiveSessionLimit(
+      environment.OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+    ),
     port: configuredPort(environment.OPENCODE_AGENTBUS_PORT),
   };
 }
@@ -73,6 +94,7 @@ export async function launchBrokerDaemon(
   const service = BrokerService.open({
     databasePath: config.databasePath,
     credentialFilePath: config.credentialFilePath,
+    limits: { maxActiveSessionsPerPrincipal: config.maxActiveSessionsPerPrincipal },
     logger,
   });
   const daemon = new BrokerDaemon({

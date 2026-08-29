@@ -3,10 +3,12 @@ import { Database, type SQLQueryBindings } from "bun:sqlite";
 import {
   BrokerIdSchema,
   ConsumedMessageResultSchema,
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
   DEFAULT_PENDING_LIST_LIMIT,
   EnqueueMessageReceiptSchema,
   EventCursorSchema,
   MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
   PendingMessageEventSchema,
   PROTOCOL_VERSION,
   RegistrationResultSchema,
@@ -74,6 +76,72 @@ export interface StoreLimits {
   readonly eventRetentionMs: number;
   readonly inactiveSessionRetentionMs: number;
   readonly rateRetentionMs: number;
+}
+
+export const BROKER_SESSION_LIMIT_POLICY = Object.freeze({
+  durableSessionsPerActiveSession: 4,
+  globalDurableSessionsPerActiveSession: 16,
+  minimumRegistrationBudget: 256,
+  maxDurableSessionsPerPrincipal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL * 4,
+  maxDurableSessionsGlobal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL * 16,
+  maxForegroundSessionReserve: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  maxRegistrationsPerPrincipalPerMinute: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+});
+
+type SessionLimitDefaults = Pick<
+  StoreLimits,
+  | "maxActiveSessionsPerPrincipal"
+  | "maxSessionsPerPrincipal"
+  | "maxSessionsGlobal"
+  | "foregroundSessionReserve"
+  | "registrationsPerPrincipalPerMinute"
+>;
+
+function checkedSessionLimitScale(value: number, factor: number, hardMaximum: number): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value <= 0 ||
+    !Number.isSafeInteger(factor) ||
+    factor <= 0 ||
+    value > Math.floor(hardMaximum / factor)
+  ) {
+    throw new TypeError("Broker session limit derivation is unsafe.");
+  }
+  const scaled = value * factor;
+  if (!Number.isSafeInteger(scaled) || scaled > hardMaximum) {
+    throw new TypeError("Broker session limit derivation is unsafe.");
+  }
+  return scaled;
+}
+
+export function deriveSessionLimitDefaults(
+  maxActiveSessionsPerPrincipal: number,
+): SessionLimitDefaults {
+  if (
+    !Number.isSafeInteger(maxActiveSessionsPerPrincipal) ||
+    maxActiveSessionsPerPrincipal < MIN_ACTIVE_SESSIONS_PER_PRINCIPAL ||
+    maxActiveSessionsPerPrincipal > MAX_ACTIVE_SESSIONS_PER_PRINCIPAL
+  ) {
+    throw new TypeError("Active-session limit exceeds the protocol range.");
+  }
+  return {
+    maxActiveSessionsPerPrincipal,
+    maxSessionsPerPrincipal: checkedSessionLimitScale(
+      maxActiveSessionsPerPrincipal,
+      BROKER_SESSION_LIMIT_POLICY.durableSessionsPerActiveSession,
+      BROKER_SESSION_LIMIT_POLICY.maxDurableSessionsPerPrincipal,
+    ),
+    maxSessionsGlobal: checkedSessionLimitScale(
+      maxActiveSessionsPerPrincipal,
+      BROKER_SESSION_LIMIT_POLICY.globalDurableSessionsPerActiveSession,
+      BROKER_SESSION_LIMIT_POLICY.maxDurableSessionsGlobal,
+    ),
+    foregroundSessionReserve: maxActiveSessionsPerPrincipal,
+    registrationsPerPrincipalPerMinute: Math.max(
+      BROKER_SESSION_LIMIT_POLICY.minimumRegistrationBudget,
+      maxActiveSessionsPerPrincipal,
+    ),
+  };
 }
 
 export interface MaintenanceResult {
@@ -2361,11 +2429,7 @@ export function principalsEqual(
 }
 
 export const DEFAULT_STORE_LIMITS: StoreLimits = Object.freeze({
-  maxActiveSessionsPerPrincipal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
-  maxSessionsPerPrincipal: 1_024,
-  maxSessionsGlobal: 4_096,
-  foregroundSessionReserve: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
-  registrationsPerPrincipalPerMinute: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  ...deriveSessionLimitDefaults(DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL),
   enqueuePerPrincipalPerMinute: 120,
   enqueuePerSessionPerMinute: 60,
   maxPendingPerPrincipal: 2_048,

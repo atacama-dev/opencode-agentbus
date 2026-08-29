@@ -9,6 +9,7 @@ import {
   CREDENTIAL_PROVISIONING_CONTRACT,
   CONNECTION_SECURITY_CONTRACT,
   CredentialFileSchema,
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
   DEFAULT_BROKER_ENDPOINT,
   DEFAULT_BROKER_STARTUP_TIMEOUT_MS,
   EnqueueMessageRequestSchema,
@@ -16,12 +17,14 @@ import {
   EVENT_STREAM_REPLAY_CONTRACT,
   EventStreamSubscriptionSchema,
   LoopbackBrokerEndpointSchema,
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   MAX_BROKER_STARTUP_TIMEOUT_MS,
   MCP_CUSTOM_METHOD_CONTRACT,
   MCP_HTTP_CONTRACT,
   MCP_INITIALIZATION_CONTRACT,
   MCP_JSON_RPC_ERROR_USES,
   METHODS,
+  MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
   MIN_BROKER_STARTUP_TIMEOUT_MS,
   McpJsonRpcRequestSchema,
   McpJsonRpcSuccessResponseSchema,
@@ -333,6 +336,7 @@ describe("loopback connection and bearer provisioning", () => {
         timeoutMs: 5_000,
         autoStartBroker: true,
         brokerStartupTimeoutMs: 5_000,
+        maxActiveSessionsPerPrincipal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
         wakeOnMessage: true,
         focusOnReceiveApproval: true,
         credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",
@@ -360,11 +364,42 @@ describe("loopback connection and bearer provisioning", () => {
     ).toMatchObject({
       autoStartBroker: true,
       brokerStartupTimeoutMs: DEFAULT_BROKER_STARTUP_TIMEOUT_MS,
+      maxActiveSessionsPerPrincipal: DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
       wakeOnMessage: false,
       focusOnReceiveApproval: false,
     });
     expect(MIN_BROKER_STARTUP_TIMEOUT_MS).toBeGreaterThanOrEqual(100);
     expect(MAX_BROKER_STARTUP_TIMEOUT_MS).toBeGreaterThan(DEFAULT_BROKER_STARTUP_TIMEOUT_MS);
+    expect(MIN_ACTIVE_SESSIONS_PER_PRINCIPAL).toBe(2);
+    expect(DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL).toBe(4_096);
+    expect(MAX_ACTIVE_SESSIONS_PER_PRINCIPAL).toBe(16_384);
+    for (const maxActiveSessionsPerPrincipal of [
+      MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
+      MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+    ]) {
+      expect(
+        TrustedConnectionConfigSchema.safeParse({
+          credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",
+          maxActiveSessionsPerPrincipal,
+        }).success,
+      ).toBe(true);
+    }
+    for (const maxActiveSessionsPerPrincipal of [
+      0,
+      1,
+      -1,
+      1.5,
+      Number.NaN,
+      MAX_ACTIVE_SESSIONS_PER_PRINCIPAL + 1,
+      "4096",
+    ]) {
+      expect(
+        TrustedConnectionConfigSchema.safeParse({
+          credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",
+          maxActiveSessionsPerPrincipal,
+        }).success,
+      ).toBe(false);
+    }
     expect(
       TrustedConnectionConfigSchema.safeParse({
         credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",

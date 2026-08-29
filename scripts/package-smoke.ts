@@ -45,6 +45,7 @@ interface BrokerCliModule {
       readonly databasePath: string;
       readonly credentialFilePath: string;
       readonly hostname: "127.0.0.1";
+      readonly maxActiveSessionsPerPrincipal: number;
       readonly port: number;
     },
     logger: { info(): void; warn(): void; error(): void },
@@ -66,7 +67,15 @@ interface InstalledBootstrapModule {
     readonly port: number;
     readonly credentialFilePath: string;
     readonly environment: Readonly<Record<string, string | undefined>>;
+    readonly maxActiveSessionsPerPrincipal: number;
   }): SpawnedBrokerProcess;
+  brokerChildEnvironment(input: {
+    readonly hostname: "127.0.0.1";
+    readonly port: number;
+    readonly credentialFilePath: string;
+    readonly environment: Readonly<Record<string, string | undefined>>;
+    readonly maxActiveSessionsPerPrincipal: number;
+  }): Readonly<Record<string, string>>;
   resolveBundledBrokerCli(): string;
 }
 
@@ -392,6 +401,7 @@ try {
       databasePath,
       credentialFilePath,
       hostname: "127.0.0.1",
+      maxActiveSessionsPerPrincipal: 300,
       port: 0,
     },
     { info() {}, warn() {}, error() {} },
@@ -493,16 +503,28 @@ try {
     PATH: process.env.PATH,
     HOME: installedStateDirectory,
     OPENCODE_AGENTBUS_DB_PATH: installedDatabasePath,
+    OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: "1",
     OPENAI_API_KEY: "must-not-be-inherited",
     NODE_OPTIONS: "--require=/must-not-be-inherited.js",
     BUN_OPTIONS: "--preload=/must-not-be-inherited.ts",
   };
-  installedBrokerProcess = bootstrap.launchBundledBroker({
+  const installedLaunchInput = {
     hostname: "127.0.0.1",
     port: installedPort,
     credentialFilePath: installedCredentialFilePath,
     environment: installedEnvironment,
-  });
+    maxActiveSessionsPerPrincipal: 300,
+  } as const;
+  const installedChildEnvironment = bootstrap.brokerChildEnvironment(installedLaunchInput);
+  if (
+    installedChildEnvironment.OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL !== "300" ||
+    "OPENAI_API_KEY" in installedChildEnvironment ||
+    "NODE_OPTIONS" in installedChildEnvironment ||
+    "BUN_OPTIONS" in installedChildEnvironment
+  ) {
+    throw new Error("Installed plugin did not propagate the explicit bounded broker capacity.");
+  }
+  installedBrokerProcess = bootstrap.launchBundledBroker(installedLaunchInput);
   const installedReadiness = new bootstrap.BrokerBootstrap(
     {
       endpoint: `http://127.0.0.1:${installedPort}`,
@@ -510,6 +532,7 @@ try {
       credentialFilePath: installedCredentialFilePath,
       autoStartBroker: false,
       brokerStartupTimeoutMs: 5_000,
+      maxActiveSessionsPerPrincipal: 300,
     },
     { environment: installedEnvironment },
   );
@@ -529,6 +552,7 @@ try {
     timeoutMs: 500,
     credentialFilePath: installedCredentialFilePath,
     autoStartBroker: false,
+    maxActiveSessionsPerPrincipal: 300,
   };
   const hooksA = await installedPluginFactory(
     smokeHost("installed_host_a", "Installed A"),

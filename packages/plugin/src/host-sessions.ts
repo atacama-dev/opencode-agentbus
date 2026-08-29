@@ -1,6 +1,7 @@
 import {
   ForegroundSessionSchema,
   HostSessionIdSchema,
+  MAX_BOOTSTRAP_SESSIONS_PER_WORKSPACE,
   SessionMetadataSchema,
 } from "@opencode-agentbus/protocol";
 import type { ForegroundSession, SessionMetadata } from "@opencode-agentbus/protocol";
@@ -27,7 +28,7 @@ export interface TrustedForegroundContext {
  * Project installation is the MVP opt-in boundary. OpenCode 1.18.19 exposes no server-side list
  * limit, so the trusted newest-first result is defensively capped before broker registration.
  */
-export const MAX_BOOTSTRAP_SESSIONS = 256;
+export const MAX_BOOTSTRAP_SESSIONS = MAX_BOOTSTRAP_SESSIONS_PER_WORKSPACE;
 
 export function safeHostSessionMetadata(title: string): SessionMetadata {
   const parsed = SessionMetadataSchema.safeParse({ title });

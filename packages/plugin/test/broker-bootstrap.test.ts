@@ -217,7 +217,9 @@ describe("persistent broker bootstrap", () => {
     let launched = false;
     let spawnCount = 0;
     const launchInputs: BundledBrokerLaunchInput[] = [];
-    const bootstrap = new BrokerBootstrap(CONFIG, {
+    const configuredLimit = 300;
+    const config = { ...CONFIG, maxActiveSessionsPerPrincipal: configuredLimit };
+    const bootstrap = new BrokerBootstrap(config, {
       environment: {
         PATH: "/trusted/bin:/usr/bin",
         HOME: "/trusted/home",
@@ -226,6 +228,7 @@ describe("persistent broker bootstrap", () => {
         OPENAI_API_KEY: "must-not-be-inherited",
         NODE_OPTIONS: "--require=/unsafe/injection.js",
         BUN_OPTIONS: "--preload=/unsafe/injection.ts",
+        OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: "1",
         UNRELATED: "must-not-be-inherited",
       },
       ...deterministicTime(),
@@ -247,6 +250,7 @@ describe("persistent broker bootstrap", () => {
     expect(launchInputs).toEqual([
       {
         credentialFilePath: CONFIG.credentialFilePath,
+        maxActiveSessionsPerPrincipal: configuredLimit,
         environment: {
           PATH: "/trusted/bin:/usr/bin",
           HOME: "/trusted/home",
@@ -264,6 +268,7 @@ describe("persistent broker bootstrap", () => {
       OPENCODE_AGENTBUS_DB_PATH: "/trusted/state.sqlite",
       OPENCODE_AGENTBUS_CREDENTIAL_FILE: CONFIG.credentialFilePath,
       OPENCODE_AGENTBUS_HOST: "127.0.0.1",
+      OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: String(configuredLimit),
       OPENCODE_AGENTBUS_PORT: "49123",
     });
   });

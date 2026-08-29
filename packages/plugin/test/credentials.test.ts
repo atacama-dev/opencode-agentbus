@@ -3,7 +3,12 @@ import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { METHODS } from "@opencode-agentbus/protocol";
+import {
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  METHODS,
+  MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
+} from "@opencode-agentbus/protocol";
 
 import {
   readCredentialFileIfPresentSecure,
@@ -61,6 +66,7 @@ describe("trusted connection config and secure credential loading", () => {
         OPENCODE_AGENTBUS_BROKER_STARTUP_TIMEOUT_MS: "1200",
         OPENCODE_AGENTBUS_WAKE_ON_MESSAGE: "true",
         OPENCODE_AGENTBUS_FOCUS_ON_RECEIVE_APPROVAL: "true",
+        OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: "1",
       },
     );
     expect(String(fromEnvironment.endpoint)).toBe("http://127.0.0.1:5000");
@@ -70,6 +76,9 @@ describe("trusted connection config and secure credential loading", () => {
     expect(fromEnvironment.brokerStartupTimeoutMs).toBe(1_200);
     expect(fromEnvironment.wakeOnMessage).toBe(true);
     expect(fromEnvironment.focusOnReceiveApproval).toBe(true);
+    expect(fromEnvironment.maxActiveSessionsPerPrincipal).toBe(
+      DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
+    );
     for (const endpoint of [
       "http://localhost:4097",
       "http://user:pass@127.0.0.1:4097",
@@ -97,6 +106,7 @@ describe("trusted connection config and secure credential loading", () => {
       brokerStartupTimeoutMs: 5_000,
       wakeOnMessage: false,
       focusOnReceiveApproval: false,
+      maxActiveSessionsPerPrincipal: DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
     });
     expect(
       resolveTrustedConnectionConfig(
@@ -106,6 +116,7 @@ describe("trusted connection config and secure credential loading", () => {
           brokerStartupTimeoutMs: 250,
           wakeOnMessage: true,
           focusOnReceiveApproval: true,
+          maxActiveSessionsPerPrincipal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
         },
         {},
       ),
@@ -114,6 +125,7 @@ describe("trusted connection config and secure credential loading", () => {
       brokerStartupTimeoutMs: 250,
       wakeOnMessage: true,
       focusOnReceiveApproval: true,
+      maxActiveSessionsPerPrincipal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
     });
     for (const brokerStartupTimeoutMs of [99, 30_001, 1.5, Number.NaN]) {
       expect(() =>
@@ -135,6 +147,34 @@ describe("trusted connection config and secure credential loading", () => {
       expect(() =>
         resolveTrustedConnectionConfig(
           { credentialFilePath: "/secure/credential", [option]: "yes" },
+          {},
+        ),
+      ).toThrow(SAFE_MODEL_ERRORS.INVALID_CONFIG);
+    }
+    for (const maxActiveSessionsPerPrincipal of [
+      MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
+      MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+    ]) {
+      expect(
+        resolveTrustedConnectionConfig(
+          { credentialFilePath: "/secure/credential", maxActiveSessionsPerPrincipal },
+          {},
+        ).maxActiveSessionsPerPrincipal,
+      ).toBe(maxActiveSessionsPerPrincipal);
+    }
+    for (const maxActiveSessionsPerPrincipal of [
+      0,
+      1,
+      -1,
+      1.5,
+      Number.NaN,
+      MAX_ACTIVE_SESSIONS_PER_PRINCIPAL + 1,
+      "4096",
+      " 4096 ",
+    ]) {
+      expect(() =>
+        resolveTrustedConnectionConfig(
+          { credentialFilePath: "/secure/credential", maxActiveSessionsPerPrincipal },
           {},
         ),
       ).toThrow(SAFE_MODEL_ERRORS.INVALID_CONFIG);

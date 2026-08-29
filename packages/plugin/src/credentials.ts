@@ -33,6 +33,7 @@ export interface AgentBusTrustedOptions {
   readonly brokerStartupTimeoutMs?: unknown;
   readonly wakeOnMessage?: unknown;
   readonly focusOnReceiveApproval?: unknown;
+  readonly maxActiveSessionsPerPrincipal?: unknown;
 }
 
 export type TrustedEnvironment = Readonly<Record<string, string | undefined>>;
@@ -45,6 +46,7 @@ const TRUSTED_OPTION_KEYS = new Set([
   "brokerStartupTimeoutMs",
   "wakeOnMessage",
   "focusOnReceiveApproval",
+  "maxActiveSessionsPerPrincipal",
 ]);
 
 function configuredBoolean(value: unknown): unknown {
@@ -96,6 +98,9 @@ export function resolveTrustedConnectionConfig(
     ...(brokerStartupTimeoutMs === undefined ? {} : { brokerStartupTimeoutMs }),
     ...(wakeOnMessage === undefined ? {} : { wakeOnMessage }),
     ...(focusOnReceiveApproval === undefined ? {} : { focusOnReceiveApproval }),
+    ...(options.maxActiveSessionsPerPrincipal === undefined
+      ? {}
+      : { maxActiveSessionsPerPrincipal: options.maxActiveSessionsPerPrincipal }),
     credentialFilePath,
   };
   const parsed = TrustedConnectionConfigSchema.safeParse(candidate);

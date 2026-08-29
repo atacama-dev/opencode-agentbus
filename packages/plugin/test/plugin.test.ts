@@ -152,6 +152,8 @@ describe("OpenCode plugin export", () => {
       "agentbus_send",
     ]);
     expect(hooks).not.toHaveProperty("mcp");
+    expect(JSON.stringify(hooks.tool)).not.toContain("maxActiveSessionsPerPrincipal");
+    expect(JSON.stringify(hooks.tool)).not.toContain("4096");
     expect(hooks.dispose).toBeFunction();
     expect(hooks.event).toBeFunction();
     await hooks.dispose?.();

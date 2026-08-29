@@ -23,7 +23,9 @@
 - Direct reply routing is broker-authoritative, targetless at the model surface, recipient-bound, restricted to retained delivered originals, and body-blind during lookup.
 - Reply persistence, optional correlation metadata, restart behavior, shared quotas, and concurrent multi-reply behavior pass deterministic coverage without weakening ordinary-message schemas.
 - Protocol v2 rejects mixed-version handshakes before registration or delivery; automatic and manual modes classify an authenticated detached v1 listener without a bearer credential, reuse, TCP startup probe, launch, or replacement.
-- Saturated foreground admission is ToolContext-derived, host-verified, broker-atomic, deterministic, dependency-protecting, and bounded to 256 active sessions across independent plugin clients.
+- Saturated foreground admission is ToolContext-derived, host-verified, broker-atomic, deterministic, dependency-protecting, and bounded to the configured per-principal active-session limit across independent plugin clients.
+- Active-session capacity defaults to 4096, accepts only integers from 2 through the protocol-v2 hard maximum of 16384, derives coherent finite durable/reserve/registration/transport quotas with overflow-safe arithmetic, and is absent from all model tool schemas and outputs.
+- Plugin autostart passes only the strict trusted option's parsed capacity in the minimal child environment; manual CLI startup parses the dedicated environment variable independently, and neither path reconfigures an already-running detached broker.
 - Every foreground host validation parses the context ID and returned registration through protocol schemas before broker readiness or connection work, and the runtime consumes that strict correlated registration without a second host query.
 - Pending toast, status, fixed wake, and receive-approval focus calls use a bounded trusted route for the exact attached-workspace session.
 
@@ -160,17 +162,38 @@ Deliverables:
 
 Status: implemented and included in the final deterministic gates below.
 
+## Configurable active-session-capacity increment
+
+Deliverables:
+
+- Protocol constants for functional minimum 2, default 4096, and hard maximum 16384, with strict trusted connection parsing and bounded protocol-v2 event bindings
+- Broker defaults derived from the configured active limit: 4× durable rows per principal, 16× global durable rows, an equal foreground reserve, and `max(256, active limit)` registration accounting
+- Finite hard maxima of 65536 durable rows per principal, 262144 globally, 16384 foreground reserve, and 16384 registrations per principal per minute, enforced with safe-integer and checked-multiplication validation
+- Strict manual CLI parsing of `OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL`, with no whitespace, sign, leading zero, non-integer, or out-of-range forms
+- Trusted plugin option propagation through the exact minimal child environment without inheriting an arbitrary manual-CLI value or exposing the setting to model tools
+- Unit coverage for default/minimum/maximum/invalid configuration, derived quotas, hard maxima, and 300 active sessions without premature registration or durable-quota displacement
+- Built integration coverage for 300 sessions aggregated across two workspaces and for deterministic saturation/displacement at a configured limit of 8
+- Installed-package smoke coverage for exact capacity propagation and child-environment secret exclusion
+- Authentication challenge capacity `4A + 256`, bounded at 65792 per minute, covering cold registration, one heartbeat per active session per minute, recovery/normal operations, reconnect bursts, and fixed workspace-startup headroom
+- Per-principal MCP/SSE capacity `ceil(A / 256) + 4`, with separate global ceilings at twice that value and hard maxima of 68 and 136
+- Configured-limit-2 built end-to-end search/send/receive/reply coverage with deterministic background displacement and an invariant active count of 2
+- Actual nine-workspace built MCP/SSE integration coverage above the historical eight-stream ceiling, plus policy boundary and hard-maximum topology tests
+- Ordinary-CI store stress coverage that registers all 4096 default active sessions without displacement or quota exhaustion
+- Operator and architecture documentation distinguishing the 256-session per-workspace bootstrap/route bound from aggregate broker capacity and requiring manual restart for a detached broker to adopt a changed value
+
+Status: implemented; final deterministic gate evidence is recorded below.
+
 ## Final verification
 
-- Unit: 456 passing, 1,936 assertions, one privileged ownership test skipped in non-root execution
-- Integration: 24 passing, 246 assertions
+- Unit: 467 passing, 2,217 assertions, one privileged ownership test skipped in non-root execution
+- Integration: 27 passing, 260 assertions
 - Strict typecheck: root, protocol, broker, plugin, and integration
 - Ordered clean-room builds: protocol → broker → plugin
 - Lint and format checks: passing
 - Dependency audit: no known vulnerabilities
 - Static plugin auditor: passing
 - Package/CLI smoke: passing
-- Unit coverage: 92.66% lines, 87.67% functions
+- Unit coverage: 92.79% lines, 87.78% functions
 - Follow-up reviewer and architect findings addressed; subsequent independent sign-off is not recorded here.
 - QA: approved on actual OpenCode 1.18.19 plus detached autostart, concurrent cold start, installed-package execution, and same-plugin unclean broker recovery; installed OpenCode 1.18.23 sparse session-status compatibility is covered by regression tests
 

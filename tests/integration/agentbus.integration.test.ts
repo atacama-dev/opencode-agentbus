@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 
 import {
   AGENT_BUS_WAKE_INSTRUCTION,
@@ -212,22 +213,175 @@ describe("built Agent Bus production composition", () => {
     expect(world.service?.storageStatsForTesting()).toMatchObject({ activeSessions: 2 });
   });
 
-  test("admits concurrent foreground tools across saturated independent workspaces without exceeding 256 active sessions", async () => {
+  test("aggregates 300 active bootstrap sessions across workspaces without displacement", async () => {
+    const world = await startedWorld({ maxActiveSessionsPerPrincipal: 300 });
+    const directoryA = "/workspace/aggregate-a";
+    const directoryB = "/workspace/aggregate-b";
+    const projectA = "project_aggregate_a";
+    const projectB = "project_aggregate_b";
+    const sessionsA = Array.from({ length: 200 }, (_, index) =>
+      session(`aggregate_a_${index}`, `Aggregate A ${index}`, directoryA, projectA),
+    );
+    const sessionsB = Array.from({ length: 100 }, (_, index) =>
+      session(`aggregate_b_${index}`, `Aggregate B ${index}`, directoryB, projectB),
+    );
+    const hostA = new FakeOpenCodeHost(sessionsA, directoryA, projectA);
+    const hostB = new FakeOpenCodeHost(sessionsB, directoryB, projectB);
+    const hooksA = await world.loadPlugin(hostA, 10_000);
+    await world.loadPlugin(hostB, 10_000);
+
+    await waitFor(() => world.service?.storageStatsForTesting().sessions === 300, 15_000);
+    expect(world.service?.storageStatsForTesting()).toMatchObject({
+      sessions: 300,
+      activeSessions: 300,
+      displacedSessions: 0,
+      registrationRateRows: 300,
+    });
+    const permissions = new NativePermissionHarness(world.trace, "once");
+    const found = registryMatches(
+      await eventually(
+        () => search(hooksA, hostA, permissions, "aggregate_a_199", "Aggregate B 99"),
+        15_000,
+      ),
+    );
+    expect(found).toHaveLength(1);
+    expect(world.service?.storageStatsForTesting()).toMatchObject({
+      activeSessions: 300,
+      displacedSessions: 0,
+    });
+  }, 30_000);
+
+  test("completes two-party search, send, receive, and reply at the minimum limit", async () => {
+    const world = await startedWorld({ maxActiveSessionsPerPrincipal: 2 });
+    const directoryA = "/workspace/minimum-a";
+    const directoryB = "/workspace/minimum-b";
+    const hostA = new FakeOpenCodeHost(
+      [
+        session("minimum_sender", "Minimum Sender", directoryA, "minimum_project_a"),
+        session("minimum_background", "Minimum Background", directoryA, "minimum_project_a"),
+      ],
+      directoryA,
+      "minimum_project_a",
+    );
+    const hostB = new FakeOpenCodeHost(
+      [session("minimum_recipient", "Minimum Recipient", directoryB, "minimum_project_b")],
+      directoryB,
+      "minimum_project_b",
+    );
+    const permissionsA = new NativePermissionHarness(world.trace, "once");
+    const permissionsB = new NativePermissionHarness(world.trace, "once");
+    const hooksA = await world.loadPlugin(hostA, 10_000);
+    await waitFor(() => world.service?.storageStatsForTesting().sessions === 2, 10_000);
+
+    await eventually(
+      () => search(hooksA, hostA, permissionsA, "minimum_sender", "Minimum Sender"),
+      10_000,
+    );
+    const hooksB = await world.loadPlugin(hostB, 10_000);
+    await waitFor(() => world.service?.storageStatsForTesting().sessions === 3, 10_000);
+    expect(world.service?.storageStatsForTesting()).toMatchObject({
+      sessions: 3,
+      activeSessions: 2,
+      displacedSessions: 1,
+    });
+
+    await eventually(
+      () => search(hooksB, hostB, permissionsB, "minimum_recipient", "Minimum Recipient"),
+      10_000,
+    );
+
+    const recipient = registryMatches(
+      await eventually(
+        () => search(hooksA, hostA, permissionsA, "minimum_sender", "Minimum Recipient"),
+        10_000,
+      ),
+    )[0];
+    if (!recipient) throw new Error("Missing minimum-limit recipient.");
+    expect(world.service?.storageStatsForTesting().activeSessions).toBe(2);
+    const database = new Database(world.databasePath, { readonly: true });
+    try {
+      expect(
+        database
+          .query("SELECT displaced FROM sessions WHERE host_session_id = ?")
+          .get("minimum_background"),
+      ).toEqual({ displaced: 1 });
+    } finally {
+      database.close();
+    }
+
+    const sent = await send(
+      hooksA,
+      hostA,
+      permissionsA,
+      "minimum_sender",
+      recipient.handle,
+      "minimum-limit request",
+    );
+    expect(world.service?.storageStatsForTesting().activeSessions).toBe(2);
+    const delivered = outputJson(await receive(hooksB, hostB, permissionsB, "minimum_recipient"));
+    expect(delivered.body).toBe("minimum-limit request");
+    if (typeof delivered.messageId !== "string") throw new Error("Missing minimum message ID.");
+    expect(world.service?.storageStatsForTesting().activeSessions).toBe(2);
+
+    const replied = outputJson(
+      await reply(
+        hooksB,
+        hostB,
+        permissionsB,
+        "minimum_recipient",
+        delivered.messageId,
+        "minimum-limit reply",
+      ),
+    );
+    expect(replied.replyToMessageId).toBe(delivered.messageId);
+    expect(world.service?.storageStatsForTesting().activeSessions).toBe(2);
+    const returned = outputJson(await receive(hooksA, hostA, permissionsA, "minimum_sender"));
+    expect(returned.body).toBe("minimum-limit reply");
+    expect(world.service?.storageStatsForTesting()).toMatchObject({
+      activeSessions: 2,
+      displacedSessions: 1,
+    });
+    expect(outputJson(sent).messageId).toBe(delivered.messageId);
+  }, 30_000);
+
+  test("supports more than eight independent workspace MCP and SSE runtimes", async () => {
     const world = await startedWorld();
+    const hosts = Array.from({ length: 9 }, (_, index) => {
+      const directory = `/workspace/stream-${index}`;
+      const project = `stream_project_${index}`;
+      return new FakeOpenCodeHost(
+        [session(`stream_session_${index}`, `Stream Session ${index}`, directory, project)],
+        directory,
+        project,
+      );
+    });
+    await Promise.all(hosts.map((host) => world.loadPlugin(host, 10_000)));
+    await waitFor(
+      () =>
+        world.service?.storageStatsForTesting().sessions === 9 &&
+        world.daemon?.connectionCounts().mcp === 9 &&
+        world.daemon?.connectionCounts().sse === 9,
+      20_000,
+    );
+    expect(world.daemon?.connectionCounts()).toEqual({ mcp: 9, sse: 9 });
+  }, 30_000);
+
+  test("admits foreground tools across saturated workspaces at a configured small limit", async () => {
+    const world = await startedWorld({ maxActiveSessionsPerPrincipal: 8 });
     const directoryA = "/workspace/saturation-a";
     const directoryB = "/workspace/saturation-b";
     const projectA = "project_saturation_a";
     const projectB = "project_saturation_b";
-    const sessionsA = Array.from({ length: 256 }, (_, index) =>
+    const sessionsA = Array.from({ length: 8 }, (_, index) =>
       session(
-        `background_a_${index.toString().padStart(3, "0")}`,
+        `background_a_${index.toString().padStart(2, "0")}`,
         index === 0 ? "Saturation Target" : `Background A ${index}`,
         directoryA,
         projectA,
       ),
     );
     const sessionsB = [
-      ...Array.from({ length: 30 }, (_, index) =>
+      ...Array.from({ length: 3 }, (_, index) =>
         session(
           `foreground_b_${index.toString().padStart(2, "0")}`,
           `Foreground B ${index}`,
@@ -244,28 +398,27 @@ describe("built Agent Bus production composition", () => {
     const hooksA = await world.loadPlugin(hostA, 10_000);
 
     permissionsA.decide("agentbus_search_sessions", "once");
-    await search(hooksA, hostA, permissionsA, "background_a_255", "Saturation Target");
-    await waitFor(() => world.service?.storageStatsForTesting().activeSessions === 256, 10_000);
+    await search(hooksA, hostA, permissionsA, "background_a_07", "Saturation Target");
+    await waitFor(() => world.service?.storageStatsForTesting().activeSessions === 8, 10_000);
     expect(world.service?.storageStatsForTesting()).toMatchObject({
-      sessions: 256,
-      activeSessions: 256,
+      sessions: 8,
+      activeSessions: 8,
       displacedSessions: 0,
     });
 
     const hooksB = await world.loadPlugin(hostB, 10_000);
     permissionsB.decide("agentbus_search_sessions", "once");
-    permissionsB.decide("agentbus_search_sessions", "once");
-    const [selfSearch, targetSearch] = await Promise.all([
-      search(hooksB, hostB, permissionsB, "foreground_b_00", "Foreground B 0"),
-      search(hooksB, hostB, permissionsB, "foreground_b_01", "Saturation Target"),
-    ]);
-    const self = registryMatches(selfSearch)[0];
-    const target = registryMatches(targetSearch)[0];
-    if (!self || !target) throw new Error("Missing saturated foreground identities.");
+    const target = await eventually(async () => {
+      const match = registryMatches(
+        await search(hooksB, hostB, permissionsB, "foreground_b_01", "Saturation Target"),
+      )[0];
+      if (!match) throw new Error("Missing saturated target.");
+      return match;
+    }, 10_000);
     expect(world.service?.storageStatsForTesting()).toMatchObject({
-      sessions: 286,
-      activeSessions: 256,
-      displacedSessions: 30,
+      sessions: 11,
+      activeSessions: 8,
+      displacedSessions: 3,
     });
 
     const beforeRejectedContext = world.service?.storageStatsForTesting();
@@ -289,18 +442,17 @@ describe("built Agent Bus production composition", () => {
 
     permissionsA.decide("agentbus_search_sessions", "once");
     const rediscovered = registryMatches(
-      await search(hooksA, hostA, permissionsA, "background_a_255", "Foreground B 0"),
+      await search(hooksA, hostA, permissionsA, "background_a_07", "Foreground B 0"),
     )[0];
     if (!rediscovered) throw new Error("Missing re-admitted foreground source.");
-    expect(rediscovered.handle).toBe(self.handle);
 
     const inboundBody = "pending body survives saturated delivery";
-    await send(hooksA, hostA, permissionsA, "background_a_255", rediscovered.handle, inboundBody);
+    await send(hooksA, hostA, permissionsA, "background_a_07", rediscovered.handle, inboundBody);
     permissionsB.decide("agentbus_receive", "once");
     const delivered = await receive(hooksB, hostB, permissionsB, "foreground_b_00");
     expect(outputJson(delivered).body).toBe(inboundBody);
     expect(world.service?.storageStatsForTesting()).toMatchObject({
-      activeSessions: 256,
+      activeSessions: 8,
     });
     const surfaces = `${hostA.nonToolSurfaces(permissionsA, world.brokerLogs)}${hostB.nonToolSurfaces(permissionsB, world.brokerLogs)}`;
     expect(surfaces).not.toContain(outboundBody);

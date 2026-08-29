@@ -4,6 +4,7 @@ import {
   ApplicationResponseEnvelopeSchema,
   AuthChallengeNonceSchema,
   AuthChallengeResponseSchema,
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
   DEFAULT_SESSION_LEASE_SECONDS,
   DeregisterSessionRequestSchema,
   EnqueueMessageRequestSchema,
@@ -53,9 +54,11 @@ import {
   type CredentialRandomSource,
 } from "./credentials";
 import {
+  BROKER_SESSION_LIMIT_POLICY,
   BrokerOperationError,
   BrokerStore,
   DEFAULT_STORE_LIMITS,
+  deriveSessionLimitDefaults,
   principalsEqual,
   type MaintenanceResult,
   type StorageStats,
@@ -127,38 +130,42 @@ const requestSchemas: Readonly<Record<Method, z.ZodTypeAny>> = {
   [METHODS.SEARCH_SESSIONS]: SearchSessionsRequestSchema,
 };
 
-function validatedLimits(overrides: Partial<BrokerLimits> | undefined): BrokerLimits {
+export { BROKER_SESSION_LIMIT_POLICY };
+
+export function resolveBrokerLimits(overrides: Partial<BrokerLimits> = {}): BrokerLimits {
+  const maxActiveSessionsPerPrincipal =
+    overrides.maxActiveSessionsPerPrincipal ??
+    (overrides.maxSessionsPerPrincipal === undefined
+      ? DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL
+      : Math.min(DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL, overrides.maxSessionsPerPrincipal));
+  const sessionDefaults = deriveSessionLimitDefaults(maxActiveSessionsPerPrincipal);
+  const maxSessionsPerPrincipal =
+    overrides.maxSessionsPerPrincipal ?? sessionDefaults.maxSessionsPerPrincipal;
   const limits: BrokerLimits = {
     ...DEFAULT_STORE_LIMITS,
+    ...sessionDefaults,
     ...overrides,
-    maxActiveSessionsPerPrincipal:
-      overrides?.maxActiveSessionsPerPrincipal ??
-      Math.min(
-        DEFAULT_STORE_LIMITS.maxActiveSessionsPerPrincipal,
-        overrides?.maxSessionsPerPrincipal ?? DEFAULT_STORE_LIMITS.maxSessionsPerPrincipal,
-      ),
+    maxActiveSessionsPerPrincipal,
+    maxSessionsPerPrincipal,
+    maxSessionsGlobal:
+      overrides.maxSessionsGlobal ??
+      Math.max(sessionDefaults.maxSessionsGlobal, maxSessionsPerPrincipal),
     foregroundSessionReserve:
-      overrides?.foregroundSessionReserve ??
-      Math.min(
-        DEFAULT_STORE_LIMITS.foregroundSessionReserve,
-        Math.max(
-          1,
-          (overrides?.maxSessionsPerPrincipal ?? DEFAULT_STORE_LIMITS.maxSessionsPerPrincipal) - 1,
-        ),
-      ),
+      overrides.foregroundSessionReserve ??
+      Math.min(sessionDefaults.foregroundSessionReserve, Math.max(1, maxSessionsPerPrincipal - 1)),
     maxPendingPerPrincipal:
-      overrides?.maxPendingPerPrincipal ??
+      overrides.maxPendingPerPrincipal ??
       Math.min(
         DEFAULT_STORE_LIMITS.maxPendingPerPrincipal,
-        overrides?.maxMessagesPerPrincipal ?? DEFAULT_STORE_LIMITS.maxMessagesPerPrincipal,
+        overrides.maxMessagesPerPrincipal ?? DEFAULT_STORE_LIMITS.maxMessagesPerPrincipal,
       ),
     maxMessagesPerSourceSession:
-      overrides?.maxMessagesPerSourceSession ??
+      overrides.maxMessagesPerSourceSession ??
       Math.min(
         DEFAULT_STORE_LIMITS.maxMessagesPerSourceSession,
         Math.max(
           1,
-          (overrides?.maxMessagesPerPrincipal ?? DEFAULT_STORE_LIMITS.maxMessagesPerPrincipal) - 1,
+          (overrides.maxMessagesPerPrincipal ?? DEFAULT_STORE_LIMITS.maxMessagesPerPrincipal) - 1,
         ),
       ),
   };
@@ -184,12 +191,21 @@ function validatedLimits(overrides: Partial<BrokerLimits> | undefined): BrokerLi
     "rateRetentionMs",
   ];
   for (const key of positiveIntegers) {
-    if (!Number.isInteger(limits[key]) || limits[key] <= 0) {
+    if (!Number.isSafeInteger(limits[key]) || limits[key] <= 0) {
       throw new TypeError("Broker limits must be positive integers.");
     }
   }
   if (limits.maxActiveSessionsPerPrincipal > MAX_ACTIVE_SESSIONS_PER_PRINCIPAL) {
     throw new TypeError("Active-session limit exceeds the protocol maximum.");
+  }
+  if (
+    limits.maxSessionsPerPrincipal > BROKER_SESSION_LIMIT_POLICY.maxDurableSessionsPerPrincipal ||
+    limits.maxSessionsGlobal > BROKER_SESSION_LIMIT_POLICY.maxDurableSessionsGlobal ||
+    limits.foregroundSessionReserve > BROKER_SESSION_LIMIT_POLICY.maxForegroundSessionReserve ||
+    limits.registrationsPerPrincipalPerMinute >
+      BROKER_SESSION_LIMIT_POLICY.maxRegistrationsPerPrincipalPerMinute
+  ) {
+    throw new TypeError("Broker session quota exceeds its hard maximum.");
   }
   if (
     limits.maxActiveSessionsPerPrincipal > limits.maxSessionsPerPrincipal ||
@@ -311,7 +327,7 @@ export class BrokerService {
       options.credentialFilePath,
       clock,
       random,
-      validatedLimits(options.limits),
+      resolveBrokerLimits(options.limits),
       credential,
       options.statementObserver,
       options.logger ?? silentLogger,

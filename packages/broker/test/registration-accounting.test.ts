@@ -26,7 +26,7 @@ describe("registration churn accounting", () => {
     }
   });
 
-  test("supports one complete 256-session bootstrap and defers the next create", () => {
+  test("supports one complete 256-session workspace bootstrap without exhausting broker capacity", () => {
     const harness = createHarness();
     try {
       for (let index = 0; index < 256; index += 1) {
@@ -49,9 +49,9 @@ describe("registration churn accounting", () => {
       );
       expect(harness.service.storageStatsForTesting()).toMatchObject({
         sessions: 257,
-        activeSessions: 256,
-        displacedSessions: 1,
-        registrationRateRows: 256,
+        activeSessions: 257,
+        displacedSessions: 0,
+        registrationRateRows: 257,
       });
     } finally {
       harness.close();

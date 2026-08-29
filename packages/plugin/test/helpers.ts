@@ -1,6 +1,7 @@
 import {
   AuthChallengeProofInputSchema,
   AuthChallengeResponseSchema,
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
   DEFAULT_SESSION_LEASE_SECONDS,
   METHODS,
   PROTOCOL_VERSION,
@@ -34,6 +35,7 @@ export const CONFIG = {
   endpoint: "http://127.0.0.1:4097",
   timeoutMs: 1_000,
   credentialFilePath: "/private/agentbus-credential.json",
+  maxActiveSessionsPerPrincipal: DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
 } as TrustedConnectionConfig;
 
 export function credential(token = TOKEN_A): CredentialFile {

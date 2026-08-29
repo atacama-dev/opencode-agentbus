@@ -5,6 +5,11 @@ import { describe, expect, test } from "bun:test";
 import { loadCredentialFile } from "../src/credentials";
 import { launchBrokerDaemon, parseBrokerEnvironment } from "../src/cli";
 import { BROKER_DEFAULTS } from "../src/server";
+import {
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
+  MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
+} from "@opencode-agentbus/protocol";
 
 describe("broker CLI configuration", () => {
   test("keeps the library root import side-effect free", async () => {
@@ -19,6 +24,7 @@ describe("broker CLI configuration", () => {
         OPENCODE_AGENTBUS_DB_PATH: "/tmp/agentbus-home/state.sqlite",
         OPENCODE_AGENTBUS_CREDENTIAL_FILE: "/tmp/agentbus-home/credential.json",
         OPENCODE_AGENTBUS_HOST: "::1",
+        OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: "16384",
         OPENCODE_AGENTBUS_PORT: "4100",
       },
       "/fallback-home",
@@ -27,6 +33,7 @@ describe("broker CLI configuration", () => {
       databasePath: "/tmp/agentbus-home/state.sqlite",
       credentialFilePath: "/tmp/agentbus-home/credential.json",
       hostname: "::1",
+      maxActiveSessionsPerPrincipal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
       port: 4100,
     });
   });
@@ -37,11 +44,43 @@ describe("broker CLI configuration", () => {
       databasePath: join(home, ".local", "state", "opencode-agentbus", "broker.sqlite"),
       credentialFilePath: join(home, ".config", "opencode-agentbus", "credential.json"),
       hostname: BROKER_DEFAULTS.hostname,
+      maxActiveSessionsPerPrincipal: DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
       port: BROKER_DEFAULTS.port,
     });
     expect(() => parseBrokerEnvironment({ OPENCODE_AGENTBUS_HOST: "0.0.0.0" }, home)).toThrow();
     expect(() => parseBrokerEnvironment({ OPENCODE_AGENTBUS_PORT: "0" }, home)).toThrow();
     expect(() => parseBrokerEnvironment({ OPENCODE_AGENTBUS_PORT: "65536" }, home)).toThrow();
+    for (const value of [
+      "",
+      "0",
+      "1",
+      "-1",
+      "+1",
+      "01",
+      " 1",
+      "1 ",
+      "1.5",
+      "1e3",
+      "NaN",
+      String(MAX_ACTIVE_SESSIONS_PER_PRINCIPAL + 1),
+    ]) {
+      expect(() =>
+        parseBrokerEnvironment(
+          { OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: value },
+          home,
+        ),
+      ).toThrow();
+    }
+    expect(
+      parseBrokerEnvironment(
+        {
+          OPENCODE_AGENTBUS_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL: String(
+            MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
+          ),
+        },
+        home,
+      ).maxActiveSessionsPerPrincipal,
+    ).toBe(MIN_ACTIVE_SESSIONS_PER_PRINCIPAL);
   });
 
   test("exposes a launch API suitable for a packaged startup smoke test", async () => {
@@ -52,12 +91,14 @@ describe("broker CLI configuration", () => {
         databasePath: join(directory, "broker.sqlite"),
         credentialFilePath,
         hostname: "127.0.0.1",
+        maxActiveSessionsPerPrincipal: 300,
         port: 0,
       },
       { info() {}, warn() {}, error() {} },
     );
     try {
       expect(daemon.endpoint).toMatch(/^http:\/\/127\.0\.0\.1:[1-9][0-9]*$/);
+      expect(daemon.authChallengeRateStateForTesting().capacity).toBe(1_456);
       expect(loadCredentialFile(credentialFilePath).token).toMatch(/^[A-Za-z0-9_-]{43}$/);
     } finally {
       await daemon.stop();

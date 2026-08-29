@@ -1,14 +1,16 @@
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  AuthenticatedClientPrincipalSchema,
   CredentialFileSchema,
   METHODS,
   PROTOCOL_VERSION,
+  type AuthenticatedClientPrincipal,
   type CredentialFile,
   type EnqueueMessageReceipt,
   type RegistrationResult,
 } from "@opencode-agentbus/protocol";
-import { BrokerDaemon, validateListenHost } from "../src/server";
+import { BROKER_DAEMON_CAPACITY_POLICY, BrokerDaemon, validateListenHost } from "../src/server";
 import {
   createHarness,
   enqueueRequest,
@@ -133,6 +135,84 @@ function eventRequest(endpoint: string, credential: CredentialFile): Request {
       "Last-Event-ID": "0",
     },
   });
+}
+
+function testPrincipal(index: number): AuthenticatedClientPrincipal {
+  return AuthenticatedClientPrincipalSchema.parse({
+    principalId: `capacity-principal-${index}`,
+    serverId: `capacity-server-${index}`,
+  });
+}
+
+interface PrivateMcpAdmission {
+  handleMcp(request: Request, principal: AuthenticatedClientPrincipal): Promise<Response>;
+}
+
+interface PrivateEventAdmission {
+  applicationHandshakeComplete: boolean;
+  handleEvents(request: Request, principal: AuthenticatedClientPrincipal): Response;
+}
+
+async function initializeForPrincipal(
+  daemon: BrokerDaemon,
+  endpoint: string,
+  principal: AuthenticatedClientPrincipal,
+  id: string,
+): Promise<{ readonly response: Response; readonly session?: McpSession }> {
+  const response = await (daemon as unknown as PrivateMcpAdmission).handleMcp(
+    new Request(`${endpoint}/mcp`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: initializeBody(id),
+    }),
+    principal,
+  );
+  const sessionId = response.headers.get("MCP-Session-Id");
+  if (!sessionId) return { response };
+  const wire = (await response.json()) as { result: { protocolVersion: string } };
+  return {
+    response,
+    session: { sessionId, protocolVersion: wire.result.protocolVersion },
+  };
+}
+
+async function terminateForPrincipal(
+  daemon: BrokerDaemon,
+  endpoint: string,
+  principal: AuthenticatedClientPrincipal,
+  session: McpSession,
+): Promise<Response> {
+  return (daemon as unknown as PrivateMcpAdmission).handleMcp(
+    new Request(`${endpoint}/mcp`, {
+      method: "DELETE",
+      headers: {
+        "MCP-Protocol-Version": session.protocolVersion,
+        "MCP-Session-Id": session.sessionId,
+      },
+    }),
+    principal,
+  );
+}
+
+function allowTestEventPrincipals(harness: Harness, daemon: BrokerDaemon): PrivateEventAdmission {
+  const service = harness.service as unknown as {
+    subscribeEvents(
+      principal: AuthenticatedClientPrincipal,
+      listener: (event: unknown) => void,
+    ): () => void;
+    replayEvents(
+      principal: AuthenticatedClientPrincipal,
+      cursor?: string,
+    ): { readonly ok: true; readonly events: readonly [] };
+  };
+  service.subscribeEvents = () => () => undefined;
+  service.replayEvents = () => ({ ok: true, events: [] });
+  const admission = daemon as unknown as PrivateEventAdmission;
+  admission.applicationHandshakeComplete = true;
+  return admission;
 }
 
 describe("local MCP daemon", () => {
@@ -421,6 +501,213 @@ describe("local MCP daemon", () => {
     expect(replacement.status).toBe(200);
     await replacement.body?.cancel();
     expect(daemon.connectionCounts().sse).toBe(0);
+  });
+
+  test("derives enough default transport capacity for more than eight workspace streams", async () => {
+    harness = createHarness();
+    daemon = new BrokerDaemon({
+      service: harness.service,
+      hostname: "127.0.0.1",
+      port: 0,
+    });
+    const endpoint = await daemon.start();
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    await completeApplicationHandshake(endpoint, credential);
+
+    const streams: Response[] = [];
+    for (let index = 0; index < 9; index += 1) {
+      const stream = await daemon.handleRequest(eventRequest(endpoint, credential));
+      expect(stream.status).toBe(200);
+      streams.push(stream);
+    }
+    expect(daemon.connectionCounts().sse).toBe(9);
+    for (const stream of streams) await stream.body?.cancel();
+    expect(daemon.connectionCounts().sse).toBe(0);
+  });
+
+  test("accepts exactly 20 default MCP sessions per principal and releases capacity", async () => {
+    harness = createHarness();
+    daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
+    const endpoint = await daemon.start();
+    const principal = testPrincipal(1);
+    const sessions: McpSession[] = [];
+
+    for (let index = 0; index < 20; index += 1) {
+      const initialized = await initializeForPrincipal(
+        daemon,
+        endpoint,
+        principal,
+        `per-principal-${index}`,
+      );
+      expect(initialized.response.status).toBe(200);
+      if (!initialized.session) throw new Error("Missing bounded MCP session.");
+      sessions.push(initialized.session);
+    }
+    expect(daemon.connectionCounts().mcp).toBe(20);
+    expect(
+      (await initializeForPrincipal(daemon, endpoint, principal, "per-principal-capped")).response
+        .status,
+    ).toBe(429);
+
+    const released = sessions.shift();
+    if (!released) throw new Error("Missing MCP session to release.");
+    expect((await terminateForPrincipal(daemon, endpoint, principal, released)).status).toBe(200);
+    const replacement = await initializeForPrincipal(
+      daemon,
+      endpoint,
+      principal,
+      "per-principal-replacement",
+    );
+    expect(replacement.response.status).toBe(200);
+    if (!replacement.session) throw new Error("Missing replacement MCP session.");
+    sessions.push(replacement.session);
+    for (const session of sessions) {
+      expect((await terminateForPrincipal(daemon, endpoint, principal, session)).status).toBe(200);
+    }
+    expect(daemon.connectionCounts().mcp).toBe(0);
+  });
+
+  test("accepts exactly 40 default MCP sessions globally and releases capacity", async () => {
+    harness = createHarness();
+    daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
+    const endpoint = await daemon.start();
+    const principals = [testPrincipal(1), testPrincipal(2)];
+    const sessions: Array<{
+      readonly principal: AuthenticatedClientPrincipal;
+      readonly session: McpSession;
+    }> = [];
+
+    for (const principal of principals) {
+      for (let index = 0; index < 20; index += 1) {
+        const initialized = await initializeForPrincipal(
+          daemon,
+          endpoint,
+          principal,
+          `global-${principal.principalId}-${index}`,
+        );
+        expect(initialized.response.status).toBe(200);
+        if (!initialized.session) throw new Error("Missing global MCP session.");
+        sessions.push({ principal, session: initialized.session });
+      }
+    }
+    expect(daemon.connectionCounts().mcp).toBe(40);
+    const thirdPrincipal = testPrincipal(3);
+    expect(
+      (await initializeForPrincipal(daemon, endpoint, thirdPrincipal, "global-capped")).response
+        .status,
+    ).toBe(429);
+
+    const released = sessions.shift();
+    if (!released) throw new Error("Missing global MCP session to release.");
+    expect(
+      (await terminateForPrincipal(daemon, endpoint, released.principal, released.session)).status,
+    ).toBe(200);
+    const replacement = await initializeForPrincipal(
+      daemon,
+      endpoint,
+      thirdPrincipal,
+      "global-replacement",
+    );
+    expect(replacement.response.status).toBe(200);
+    if (!replacement.session) throw new Error("Missing global replacement MCP session.");
+    sessions.push({ principal: thirdPrincipal, session: replacement.session });
+    for (const item of sessions) {
+      expect(
+        (await terminateForPrincipal(daemon, endpoint, item.principal, item.session)).status,
+      ).toBe(200);
+    }
+    expect(daemon.connectionCounts().mcp).toBe(0);
+  });
+
+  test("accepts exactly 20 default SSE streams per principal and releases capacity", async () => {
+    harness = createHarness();
+    daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
+    const endpoint = await daemon.start();
+    const admission = allowTestEventPrincipals(harness, daemon);
+    const principal = testPrincipal(1);
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const streams: Response[] = [];
+
+    for (let index = 0; index < 20; index += 1) {
+      const stream = admission.handleEvents(eventRequest(endpoint, credential), principal);
+      expect(stream.status).toBe(200);
+      streams.push(stream);
+    }
+    expect(daemon.connectionCounts().sse).toBe(20);
+    expect(admission.handleEvents(eventRequest(endpoint, credential), principal).status).toBe(429);
+
+    await streams.shift()?.body?.cancel();
+    const replacement = admission.handleEvents(eventRequest(endpoint, credential), principal);
+    expect(replacement.status).toBe(200);
+    streams.push(replacement);
+    for (const stream of streams) await stream.body?.cancel();
+    expect(daemon.connectionCounts().sse).toBe(0);
+  });
+
+  test("accepts exactly 40 default SSE streams globally and releases capacity", async () => {
+    harness = createHarness();
+    daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
+    const endpoint = await daemon.start();
+    const admission = allowTestEventPrincipals(harness, daemon);
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const streams: Response[] = [];
+
+    for (const principal of [testPrincipal(1), testPrincipal(2)]) {
+      for (let index = 0; index < 20; index += 1) {
+        const stream = admission.handleEvents(eventRequest(endpoint, credential), principal);
+        expect(stream.status).toBe(200);
+        streams.push(stream);
+      }
+    }
+    expect(daemon.connectionCounts().sse).toBe(40);
+    const thirdPrincipal = testPrincipal(3);
+    expect(admission.handleEvents(eventRequest(endpoint, credential), thirdPrincipal).status).toBe(
+      429,
+    );
+
+    await streams.shift()?.body?.cancel();
+    const replacement = admission.handleEvents(eventRequest(endpoint, credential), thirdPrincipal);
+    expect(replacement.status).toBe(200);
+    streams.push(replacement);
+    for (const stream of streams) await stream.body?.cancel();
+    expect(daemon.connectionCounts().sse).toBe(0);
+  });
+
+  test("validates explicit transport overrides against finite hard and global ceilings", () => {
+    harness = createHarness();
+    const service = harness.service;
+    for (const options of [
+      {
+        maxAuthChallengesPerMinute: BROKER_DAEMON_CAPACITY_POLICY.maxAuthChallengesPerMinute + 1,
+      },
+      {
+        maxMcpSessionsPerPrincipal: BROKER_DAEMON_CAPACITY_POLICY.maxMcpSessionsPerPrincipal + 1,
+      },
+      { maxMcpSessionsGlobal: BROKER_DAEMON_CAPACITY_POLICY.maxMcpSessionsGlobal + 1 },
+      {
+        maxSseConnectionsPerPrincipal:
+          BROKER_DAEMON_CAPACITY_POLICY.maxSseConnectionsPerPrincipal + 1,
+      },
+      { maxSseConnectionsGlobal: BROKER_DAEMON_CAPACITY_POLICY.maxSseConnectionsGlobal + 1 },
+      { maxMcpSessionsPerPrincipal: 2, maxMcpSessionsGlobal: 1 },
+      { maxSseConnectionsPerPrincipal: 2, maxSseConnectionsGlobal: 1 },
+    ]) {
+      expect(
+        () =>
+          new BrokerDaemon({
+            service,
+            hostname: "127.0.0.1",
+            port: 0,
+            ...options,
+          }),
+      ).toThrow();
+    }
   });
 
   test("closes slow SSE consumers when bounded buffering fills", async () => {

@@ -160,13 +160,14 @@ describe("broker registry and persistence", () => {
   });
 
   test("defers background registrations instead of bypassing active-session limits", () => {
-    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 1 } });
+    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 2 } });
     try {
       expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("one")));
       expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("two")));
+      expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("three")));
       expect(harness.service.storageStatsForTesting()).toMatchObject({
-        sessions: 2,
-        activeSessions: 1,
+        sessions: 3,
+        activeSessions: 2,
         displacedSessions: 1,
       });
     } finally {
@@ -175,7 +176,7 @@ describe("broker registry and persistence", () => {
   });
 
   test("does not bypass the active limit by refreshing an inactive existing registration", () => {
-    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 1 } });
+    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 2 } });
     try {
       const first = expectSuccess<RegistrationResult>(
         harness.service.dispatch(harness.service.principal, registerRequest("first")),
@@ -189,10 +190,11 @@ describe("broker registry and persistence", () => {
       const second = expectSuccess<RegistrationResult>(
         harness.service.dispatch(harness.service.principal, registerRequest("second")),
       );
+      expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("third")));
 
       expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("first")));
       expect(harness.service.storageStatsForTesting()).toMatchObject({
-        activeSessions: 1,
+        activeSessions: 2,
         displacedSessions: 1,
       });
       expect(second.registration).toBe("created");
@@ -202,13 +204,16 @@ describe("broker registry and persistence", () => {
   });
 
   test("does not bypass the active limit by heartbeating an expired registration", () => {
-    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 1 } });
+    const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 2 } });
     try {
       const expired = expectSuccess<RegistrationResult>(
         harness.service.dispatch(harness.service.principal, registerRequest("expired")),
       );
       harness.clock.advance(121_000);
       expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("active")));
+      expectSuccess(
+        harness.service.dispatch(harness.service.principal, registerRequest("also-active")),
+      );
 
       expectSuccess(
         harness.service.dispatch(
@@ -217,7 +222,7 @@ describe("broker registry and persistence", () => {
         ),
       );
       expect(harness.service.storageStatsForTesting()).toMatchObject({
-        activeSessions: 1,
+        activeSessions: 2,
         displacedSessions: 1,
       });
     } finally {

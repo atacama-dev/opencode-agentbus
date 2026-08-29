@@ -4,12 +4,15 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 
 import {
+  DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
   DEFAULT_BROKER_ENDPOINT,
   DEFAULT_BROKER_STARTUP_TIMEOUT_MS,
   DEFAULT_CONNECTION_TIMEOUT_MS,
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   MAX_BROKER_STARTUP_TIMEOUT_MS,
   MAX_CONNECTION_TIMEOUT_MS,
   MAX_CREDENTIAL_FILE_PATH_BYTES,
+  MIN_ACTIVE_SESSIONS_PER_PRINCIPAL,
   MIN_CONNECTION_TIMEOUT_MS,
   MIN_BROKER_STARTUP_TIMEOUT_MS,
 } from "./constants";
@@ -59,6 +62,12 @@ export const TrustedConnectionConfigSchema = z
       .default(DEFAULT_BROKER_STARTUP_TIMEOUT_MS),
     wakeOnMessage: z.boolean().default(false),
     focusOnReceiveApproval: z.boolean().default(false),
+    maxActiveSessionsPerPrincipal: z
+      .number()
+      .int()
+      .min(MIN_ACTIVE_SESSIONS_PER_PRINCIPAL)
+      .max(MAX_ACTIVE_SESSIONS_PER_PRINCIPAL)
+      .default(DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL),
   })
   .strict()
   .readonly();

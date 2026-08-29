@@ -18,6 +18,7 @@ import {
   HandshakeRequestSchema,
   ListPendingMessagesRequestSchema,
   ListPendingMessagesResultSchema,
+  MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   MAX_QUERY_BYTES,
   MAX_SESSION_LEASE_SECONDS,
   METHODS,
@@ -357,6 +358,20 @@ describe("metadata-only notifications and pending recovery", () => {
         event,
       }).success,
     ).toBe(true);
+    expect(
+      AuthenticatedPendingMessageEventInputSchema.safeParse({
+        principal,
+        bindings: Array.from({ length: 300 }, () => binding),
+        event,
+      }).success,
+    ).toBe(true);
+    expect(
+      AuthenticatedPendingMessageEventInputSchema.safeParse({
+        principal,
+        bindings: Array.from({ length: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL + 1 }, () => binding),
+        event,
+      }).success,
+    ).toBe(false);
     expect(pendingEventMatchesTargetBinding(event, binding)).toBe(true);
   });
 
