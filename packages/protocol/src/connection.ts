@@ -5,10 +5,13 @@ import { z } from "zod";
 
 import {
   DEFAULT_BROKER_ENDPOINT,
+  DEFAULT_BROKER_STARTUP_TIMEOUT_MS,
   DEFAULT_CONNECTION_TIMEOUT_MS,
+  MAX_BROKER_STARTUP_TIMEOUT_MS,
   MAX_CONNECTION_TIMEOUT_MS,
   MAX_CREDENTIAL_FILE_PATH_BYTES,
   MIN_CONNECTION_TIMEOUT_MS,
+  MIN_BROKER_STARTUP_TIMEOUT_MS,
 } from "./constants";
 import { BrokerIdSchema, PrincipalIdSchema, ServerIdSchema } from "./schemas";
 import type { BrokerId, PrincipalId } from "./schemas";
@@ -47,6 +50,15 @@ export const TrustedConnectionConfigSchema = z
       .max(MAX_CONNECTION_TIMEOUT_MS)
       .default(DEFAULT_CONNECTION_TIMEOUT_MS),
     credentialFilePath: CredentialFilePathSchema,
+    autoStartBroker: z.boolean().default(true),
+    brokerStartupTimeoutMs: z
+      .number()
+      .int()
+      .min(MIN_BROKER_STARTUP_TIMEOUT_MS)
+      .max(MAX_BROKER_STARTUP_TIMEOUT_MS)
+      .default(DEFAULT_BROKER_STARTUP_TIMEOUT_MS),
+    wakeOnMessage: z.boolean().default(false),
+    focusOnReceiveApproval: z.boolean().default(false),
   })
   .strict()
   .readonly();

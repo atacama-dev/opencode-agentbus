@@ -27,7 +27,7 @@ const WRONG_TOKEN = "REREREREREREREREREREREREREREREREREREREREREQ";
 const CLIENT_NONCE = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI";
 const OTHER_CLIENT_NONCE = "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU";
 const SERVER_NONCE = "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM";
-const EXPECTED_PROOF = "c0cdb83f4f7b054baebadd88a8f6cd39537049377e26444585123de60fa90c5b";
+const EXPECTED_PROOF = "b320363b107047e4dc0014fbe80686d6f5b8f384a5b706f6a23c6d384a0251d4";
 
 const proofInput = AuthChallengeProofInputSchema.parse({
   protocolVersion: PROTOCOL_VERSION,
@@ -144,7 +144,7 @@ describe("canonical challenge proof", () => {
         token: TOKEN,
         expectedServerId: "server_01",
         expectedClientNonce: CLIENT_NONCE,
-        response: { ...response, protocolVersion: 2 },
+        response: { ...response, protocolVersion: 1 },
       }),
     ).toBe(false);
     expect(
@@ -234,10 +234,10 @@ describe("challenge response hardening and MCP correlation", () => {
       serverId: "server_01",
     });
     const handshakeRequest = HandshakeRequestSchema.parse({
-      protocolVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
       requestId: "request_01",
       method: "agentbus.handshake",
-      params: { supportedProtocolVersions: [1] },
+      params: { supportedProtocolVersions: [PROTOCOL_VERSION] },
     });
     const matching = negotiateProtocolVersion(handshakeRequest, "broker_01", principal);
     const replacement = negotiateProtocolVersion(handshakeRequest, "broker_other", principal);

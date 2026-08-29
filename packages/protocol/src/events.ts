@@ -3,6 +3,7 @@ import { z } from "zod";
 import { MAX_ACTIVE_SESSIONS_PER_PRINCIPAL, PENDING_MESSAGE_EVENT_TYPE } from "./constants";
 import {
   AuthenticatedClientPrincipalSchema,
+  EventCursorSchema,
   EventIdSchema,
   PrincipalSessionBindingSchema,
 } from "./schemas";
@@ -25,16 +26,16 @@ function sameSession(left: SessionIdentity, right: SessionIdentity): boolean {
 export const EventStreamSubscriptionSchema = z
   .object({
     principal: AuthenticatedClientPrincipalSchema,
-    lastEventId: EventIdSchema.optional(),
+    lastEventId: EventCursorSchema.optional(),
     authoritativeRecoveryCompleted: z.boolean(),
   })
   .strict()
   .superRefine((subscription, context) => {
-    if (subscription.lastEventId === undefined && !subscription.authoritativeRecoveryCompleted) {
+    if (subscription.lastEventId === undefined) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ["authoritativeRecoveryCompleted"],
-        message: "cursorless event streams require list-pending recovery before live delivery",
+        path: ["lastEventId"],
+        message: "event streams require an authoritative replay watermark",
       });
     }
   })
@@ -51,10 +52,10 @@ export function eventsAfterCursor(
   events: readonly PendingMessageEvent[],
   cursor: string,
 ): readonly PendingMessageEvent[] {
-  const parsedCursor = EventIdSchema.parse(cursor);
+  const parsedCursor = EventCursorSchema.parse(cursor);
   return events
     .map((event) => PendingMessageEventSchema.parse(event))
-    .filter((event) => compareEventIds(event.eventId, parsedCursor) > 0)
+    .filter((event) => BigInt(event.eventId) > BigInt(parsedCursor))
     .sort((left, right) => compareEventIds(left.eventId, right.eventId));
 }
 

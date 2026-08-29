@@ -29,6 +29,7 @@ import {
   DeregisterSessionResultSchema,
   EnqueueMessageReceiptSchema,
   ErrorEnvelopeSchema,
+  EventCursorSchema,
   EventIdSchema,
   HostSessionIdSchema,
   MessageBodySchema,
@@ -38,11 +39,14 @@ import {
   RegistrationResultSchema,
   RegistrySearchMatchSchema,
   RejectMessageResultSchema,
+  ReplyMessageReceiptSchema,
   RequestIdSchema,
   SafeErrorDetailsSchema,
   SearchQueryHashSchema,
   SessionHeartbeatResultSchema,
   SessionIdentitySchema,
+  SessionFingerprintSchema,
+  SessionLeaseSecondsSchema,
   SessionMetadataSchema,
 } from "./schemas";
 import type {
@@ -75,6 +79,19 @@ function successEnvelopeSchema<Result extends z.ZodTypeAny>(result: Result) {
       requestId: RequestIdSchema,
       ok: z.literal(true),
       result,
+    })
+    .strict()
+    .readonly();
+}
+
+function foregroundSuccessEnvelopeSchema<Result extends z.ZodTypeAny>(result: Result) {
+  return z
+    .object({
+      protocolVersion: z.literal(PROTOCOL_VERSION),
+      requestId: RequestIdSchema,
+      ok: z.literal(true),
+      result,
+      foregroundRecovery: ForegroundPendingRecoverySchema,
     })
     .strict()
     .readonly();
@@ -156,6 +173,40 @@ export const RegisterSessionResponseSchema = z.union([
 ]);
 export type RegisterSessionResponse = z.infer<typeof RegisterSessionResponseSchema>;
 
+export const ForegroundSessionSchema = z
+  .object({
+    hostSessionId: HostSessionIdSchema,
+    metadata: SessionMetadataSchema,
+  })
+  .strict()
+  .readonly();
+export type ForegroundSession = z.infer<typeof ForegroundSessionSchema>;
+
+export const ForegroundIdentityRequestSchema = versionedRequestSchema(
+  METHODS.RESOLVE_FOREGROUND_SESSION,
+  ForegroundSessionSchema,
+);
+export type ForegroundIdentityRequest = z.infer<typeof ForegroundIdentityRequestSchema>;
+export const ForegroundIdentityResultSchema = z
+  .object({
+    hostSessionId: HostSessionIdSchema,
+    identity: SessionIdentitySchema,
+    fingerprint: SessionFingerprintSchema,
+    metadata: SessionMetadataSchema,
+    leaseSeconds: SessionLeaseSecondsSchema,
+  })
+  .strict()
+  .readonly();
+export type ForegroundIdentityResult = z.infer<typeof ForegroundIdentityResultSchema>;
+export const ForegroundIdentitySuccessEnvelopeSchema = successEnvelopeSchema(
+  ForegroundIdentityResultSchema,
+);
+export const ForegroundIdentityResponseSchema = z.union([
+  ForegroundIdentitySuccessEnvelopeSchema,
+  ErrorEnvelopeSchema,
+]);
+export type ForegroundIdentityResponse = z.infer<typeof ForegroundIdentityResponseSchema>;
+
 const SessionClaimParamsSchema = z.object({ session: SessionIdentitySchema }).strict().readonly();
 
 export const HeartbeatSessionRequestSchema = versionedRequestSchema(
@@ -186,86 +237,18 @@ export const DeregisterSessionResponseSchema = z.union([
 ]);
 export type DeregisterSessionResponse = z.infer<typeof DeregisterSessionResponseSchema>;
 
-const EnqueueMessageParamsSchema = z
-  .object({
-    source: SessionIdentitySchema,
-    target: SessionIdentitySchema,
-    body: MessageBodySchema,
-    ttlSeconds: z
-      .number()
-      .int()
-      .min(MIN_MESSAGE_TTL_SECONDS)
-      .max(MAX_MESSAGE_TTL_SECONDS)
-      .default(DEFAULT_MESSAGE_TTL_SECONDS),
-  })
-  .strict()
-  .superRefine((params, context) => {
-    if (
-      params.source.broker.brokerId !== params.target.broker.brokerId ||
-      params.source.broker.serverId !== params.target.broker.serverId
-    ) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["target"],
-        message: "source and target must belong to the same broker and server",
-      });
-    }
-  })
-  .readonly();
+const MessageTtlSecondsSchema = z
+  .number()
+  .int()
+  .min(MIN_MESSAGE_TTL_SECONDS)
+  .max(MAX_MESSAGE_TTL_SECONDS)
+  .default(DEFAULT_MESSAGE_TTL_SECONDS);
 
-export const EnqueueMessageRequestSchema = versionedRequestSchema(
-  METHODS.ENQUEUE_MESSAGE,
-  EnqueueMessageParamsSchema,
-);
-export type EnqueueMessageRequest = z.infer<typeof EnqueueMessageRequestSchema>;
-export const EnqueueMessageSuccessEnvelopeSchema = successEnvelopeSchema(
-  EnqueueMessageReceiptSchema,
-);
-export const EnqueueMessageResponseSchema = z.union([
-  EnqueueMessageSuccessEnvelopeSchema,
-  ErrorEnvelopeSchema,
-]);
-export type EnqueueMessageResponse = z.infer<typeof EnqueueMessageResponseSchema>;
-
-const TargetClaimParamsSchema = z.object({ target: SessionIdentitySchema }).strict().readonly();
-
-export const PeekNextMessageRequestSchema = versionedRequestSchema(
-  METHODS.PEEK_NEXT_MESSAGE,
-  TargetClaimParamsSchema,
-);
-export type PeekNextMessageRequest = z.infer<typeof PeekNextMessageRequestSchema>;
-
-export const PeekNextMessageResultSchema = z
-  .object({ header: PendingMessageHeaderSchema.nullable() })
-  .strict()
-  .readonly();
-export type PeekNextMessageResult = z.infer<typeof PeekNextMessageResultSchema>;
-export const PeekNextMessageSuccessEnvelopeSchema = successEnvelopeSchema(
-  PeekNextMessageResultSchema,
-);
-export const PeekNextMessageResponseSchema = z.union([
-  PeekNextMessageSuccessEnvelopeSchema,
-  ErrorEnvelopeSchema,
-]);
-export type PeekNextMessageResponse = z.infer<typeof PeekNextMessageResponseSchema>;
-
-const ListPendingMessagesParamsSchema = z
-  .object({
-    target: SessionIdentitySchema,
-    limit: z.number().int().min(1).max(MAX_PENDING_LIST_LIMIT).default(DEFAULT_PENDING_LIST_LIMIT),
-  })
-  .strict()
-  .readonly();
-export const ListPendingMessagesRequestSchema = versionedRequestSchema(
-  METHODS.LIST_PENDING_MESSAGES,
-  ListPendingMessagesParamsSchema,
-);
-export type ListPendingMessagesRequest = z.infer<typeof ListPendingMessagesRequestSchema>;
-
-export const ListPendingMessagesResultSchema = z
+export const ForegroundPendingRecoverySchema = z
   .object({
     target: SessionIdentitySchema,
     requestedLimit: z.number().int().min(1).max(MAX_PENDING_LIST_LIMIT),
+    eventCursor: EventCursorSchema,
     headers: z.array(PendingMessageHeaderSchema).max(MAX_PENDING_LIST_LIMIT).readonly(),
   })
   .strict()
@@ -298,6 +281,115 @@ export const ListPendingMessagesResultSchema = z
     }
   })
   .readonly();
+export type ForegroundPendingRecovery = z.infer<typeof ForegroundPendingRecoverySchema>;
+
+const EnqueueMessageParamsSchema = z
+  .object({
+    source: SessionIdentitySchema,
+    target: SessionIdentitySchema,
+    body: MessageBodySchema,
+    ttlSeconds: MessageTtlSecondsSchema,
+    foreground: ForegroundSessionSchema.optional(),
+  })
+  .strict()
+  .superRefine((params, context) => {
+    if (
+      params.source.broker.brokerId !== params.target.broker.brokerId ||
+      params.source.broker.serverId !== params.target.broker.serverId
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["target"],
+        message: "source and target must belong to the same broker and server",
+      });
+    }
+  })
+  .readonly();
+
+export const EnqueueMessageRequestSchema = versionedRequestSchema(
+  METHODS.ENQUEUE_MESSAGE,
+  EnqueueMessageParamsSchema,
+);
+export type EnqueueMessageRequest = z.infer<typeof EnqueueMessageRequestSchema>;
+export const EnqueueMessageSuccessEnvelopeSchema = successEnvelopeSchema(
+  EnqueueMessageReceiptSchema,
+);
+export const EnqueueMessageForegroundSuccessEnvelopeSchema = foregroundSuccessEnvelopeSchema(
+  EnqueueMessageReceiptSchema,
+);
+export const EnqueueMessageResponseSchema = z.union([
+  EnqueueMessageForegroundSuccessEnvelopeSchema,
+  EnqueueMessageSuccessEnvelopeSchema,
+  ErrorEnvelopeSchema,
+]);
+export type EnqueueMessageResponse = z.infer<typeof EnqueueMessageResponseSchema>;
+
+const ReplyMessageParamsSchema = z
+  .object({
+    source: SessionIdentitySchema,
+    messageId: MessageIdSchema,
+    body: MessageBodySchema,
+    ttlSeconds: MessageTtlSecondsSchema,
+    foreground: ForegroundSessionSchema.optional(),
+  })
+  .strict()
+  .readonly();
+
+export const ReplyMessageRequestSchema = versionedRequestSchema(
+  METHODS.REPLY_MESSAGE,
+  ReplyMessageParamsSchema,
+);
+export type ReplyMessageRequest = z.infer<typeof ReplyMessageRequestSchema>;
+export const ReplyMessageSuccessEnvelopeSchema = successEnvelopeSchema(ReplyMessageReceiptSchema);
+export const ReplyMessageForegroundSuccessEnvelopeSchema =
+  foregroundSuccessEnvelopeSchema(ReplyMessageReceiptSchema);
+export const ReplyMessageResponseSchema = z.union([
+  ReplyMessageForegroundSuccessEnvelopeSchema,
+  ReplyMessageSuccessEnvelopeSchema,
+  ErrorEnvelopeSchema,
+]);
+export type ReplyMessageResponse = z.infer<typeof ReplyMessageResponseSchema>;
+
+const TargetClaimParamsSchema = z
+  .object({ target: SessionIdentitySchema, foreground: ForegroundSessionSchema.optional() })
+  .strict()
+  .readonly();
+
+export const PeekNextMessageRequestSchema = versionedRequestSchema(
+  METHODS.PEEK_NEXT_MESSAGE,
+  TargetClaimParamsSchema,
+);
+export type PeekNextMessageRequest = z.infer<typeof PeekNextMessageRequestSchema>;
+
+export const PeekNextMessageResultSchema = z
+  .object({ header: PendingMessageHeaderSchema.nullable() })
+  .strict()
+  .readonly();
+export type PeekNextMessageResult = z.infer<typeof PeekNextMessageResultSchema>;
+export const PeekNextMessageSuccessEnvelopeSchema = successEnvelopeSchema(
+  PeekNextMessageResultSchema,
+);
+export const PeekNextMessageResponseSchema = z.union([
+  PeekNextMessageSuccessEnvelopeSchema,
+  ErrorEnvelopeSchema,
+]);
+export type PeekNextMessageResponse = z.infer<typeof PeekNextMessageResponseSchema>;
+
+const ListPendingMessagesParamsSchema = z
+  .object({
+    target: SessionIdentitySchema,
+    limit: z.number().int().min(1).max(MAX_PENDING_LIST_LIMIT).default(DEFAULT_PENDING_LIST_LIMIT),
+    foreground: ForegroundSessionSchema.optional(),
+  })
+  .strict()
+  .readonly();
+export const ListPendingMessagesRequestSchema = versionedRequestSchema(
+  METHODS.LIST_PENDING_MESSAGES,
+  ListPendingMessagesParamsSchema,
+);
+export type ListPendingMessagesRequest = z.infer<typeof ListPendingMessagesRequestSchema>;
+
+export const ListPendingMessagesResultSchema = ForegroundPendingRecoverySchema;
 export type ListPendingMessagesResult = z.infer<typeof ListPendingMessagesResultSchema>;
 export const ListPendingMessagesSuccessEnvelopeSchema = successEnvelopeSchema(
   ListPendingMessagesResultSchema,
@@ -313,6 +405,7 @@ const ExpectedMessageParamsSchema = z
     messageId: MessageIdSchema,
     target: SessionIdentitySchema,
     expectedBodyHash: BodyHashSchema,
+    foreground: ForegroundSessionSchema.optional(),
   })
   .strict()
   .readonly();
@@ -348,6 +441,7 @@ const SearchSessionsParamsSchema = z
     requester: SessionIdentitySchema,
     scope: BrokerServerIdentitySchema,
     query: CanonicalSearchQuerySchema,
+    foreground: ForegroundSessionSchema.optional(),
     limit: z
       .number()
       .int()
@@ -418,7 +512,11 @@ export type SearchSessionsResult = z.infer<typeof SearchSessionsResultSchema>;
 export const SearchSessionsSuccessEnvelopeSchema = successEnvelopeSchema(
   SearchSessionsResultSchema,
 );
+export const SearchSessionsForegroundSuccessEnvelopeSchema = foregroundSuccessEnvelopeSchema(
+  SearchSessionsResultSchema,
+);
 export const SearchSessionsResponseSchema = z.union([
+  SearchSessionsForegroundSuccessEnvelopeSchema,
   SearchSessionsSuccessEnvelopeSchema,
   ErrorEnvelopeSchema,
 ]);
@@ -429,9 +527,11 @@ export type SearchSessionsResponse = z.infer<typeof SearchSessionsResponseSchema
 export const ApplicationOperationRequestSchema = z.union([
   HandshakeRequestSchema,
   RegisterSessionRequestSchema,
+  ForegroundIdentityRequestSchema,
   HeartbeatSessionRequestSchema,
   DeregisterSessionRequestSchema,
   EnqueueMessageRequestSchema,
+  ReplyMessageRequestSchema,
   PeekNextMessageRequestSchema,
   ListPendingMessagesRequestSchema,
   ConsumeMessageRequestSchema,
@@ -443,14 +543,19 @@ export type ApplicationOperationRequest = z.infer<typeof ApplicationOperationReq
 export const ApplicationResponseEnvelopeSchema = z.union([
   HandshakeSuccessEnvelopeSchema,
   RegisterSessionSuccessEnvelopeSchema,
+  ForegroundIdentitySuccessEnvelopeSchema,
   HeartbeatSessionSuccessEnvelopeSchema,
   DeregisterSessionSuccessEnvelopeSchema,
   EnqueueMessageSuccessEnvelopeSchema,
+  EnqueueMessageForegroundSuccessEnvelopeSchema,
+  ReplyMessageSuccessEnvelopeSchema,
+  ReplyMessageForegroundSuccessEnvelopeSchema,
   PeekNextMessageSuccessEnvelopeSchema,
   ListPendingMessagesSuccessEnvelopeSchema,
   ConsumeMessageSuccessEnvelopeSchema,
   RejectMessageSuccessEnvelopeSchema,
   SearchSessionsSuccessEnvelopeSchema,
+  SearchSessionsForegroundSuccessEnvelopeSchema,
   ErrorEnvelopeSchema,
 ]);
 export type ApplicationResponseEnvelope = z.infer<typeof ApplicationResponseEnvelopeSchema>;
@@ -507,12 +612,16 @@ function responseSchemaForMethod(method: string): z.ZodTypeAny {
       return HandshakeResponseSchema;
     case METHODS.REGISTER_SESSION:
       return RegisterSessionResponseSchema;
+    case METHODS.RESOLVE_FOREGROUND_SESSION:
+      return ForegroundIdentityResponseSchema;
     case METHODS.HEARTBEAT_SESSION:
       return HeartbeatSessionResponseSchema;
     case METHODS.DEREGISTER_SESSION:
       return DeregisterSessionResponseSchema;
     case METHODS.ENQUEUE_MESSAGE:
       return EnqueueMessageResponseSchema;
+    case METHODS.REPLY_MESSAGE:
+      return ReplyMessageResponseSchema;
     case METHODS.PEEK_NEXT_MESSAGE:
       return PeekNextMessageResponseSchema;
     case METHODS.LIST_PENDING_MESSAGES:
@@ -688,6 +797,21 @@ export const AuthenticatedEnqueueOperationInputSchema = z
   .readonly();
 export type AuthenticatedEnqueueOperationInput = z.infer<
   typeof AuthenticatedEnqueueOperationInputSchema
+>;
+
+export const AuthenticatedReplyOperationInputSchema = z
+  .object({
+    principal: AuthenticatedClientPrincipalSchema,
+    binding: PrincipalSessionBindingSchema,
+    request: ReplyMessageRequestSchema,
+  })
+  .strict()
+  .superRefine((input, context) =>
+    enforcePrincipalBinding(input.principal, input.binding, input.request.params.source, context),
+  )
+  .readonly();
+export type AuthenticatedReplyOperationInput = z.infer<
+  typeof AuthenticatedReplyOperationInputSchema
 >;
 
 export const AuthenticatedPeekOperationInputSchema = z

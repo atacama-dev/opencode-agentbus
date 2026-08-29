@@ -2,22 +2,27 @@ import { describe, expect, test } from "bun:test";
 
 import {
   BROKER_LIFECYCLE_CONTRACT,
+  BROKER_CLI_EXIT_CODES,
+  BROKER_CLI_EXIT_CONTRACT,
   AuthenticatedClientPrincipalSchema,
   CREDENTIAL_FILE_MODE,
   CREDENTIAL_PROVISIONING_CONTRACT,
   CONNECTION_SECURITY_CONTRACT,
   CredentialFileSchema,
   DEFAULT_BROKER_ENDPOINT,
+  DEFAULT_BROKER_STARTUP_TIMEOUT_MS,
   EnqueueMessageRequestSchema,
   EnqueueMessageSuccessEnvelopeSchema,
   EVENT_STREAM_REPLAY_CONTRACT,
   EventStreamSubscriptionSchema,
   LoopbackBrokerEndpointSchema,
+  MAX_BROKER_STARTUP_TIMEOUT_MS,
   MCP_CUSTOM_METHOD_CONTRACT,
   MCP_HTTP_CONTRACT,
   MCP_INITIALIZATION_CONTRACT,
   MCP_JSON_RPC_ERROR_USES,
   METHODS,
+  MIN_BROKER_STARTUP_TIMEOUT_MS,
   McpJsonRpcRequestSchema,
   McpJsonRpcSuccessResponseSchema,
   PENDING_MESSAGE_EVENT_TYPE,
@@ -143,7 +148,7 @@ describe("exact MCP Streamable HTTP mapping", () => {
 
   test("carries application success and canonical errors inside JSON-RPC success result", () => {
     const applicationSuccess = EnqueueMessageSuccessEnvelopeSchema.parse({
-      protocolVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
       requestId: request.requestId,
       ok: true,
       result: {
@@ -196,7 +201,7 @@ describe("principal-wide SSE topology and replay", () => {
     }),
   );
   const event = PendingMessageEventSchema.parse({
-    protocolVersion: 1,
+    protocolVersion: PROTOCOL_VERSION,
     event: PENDING_MESSAGE_EVENT_TYPE,
     eventId: "42",
     correlationId: "request_01",
@@ -225,7 +230,7 @@ describe("principal-wide SSE topology and replay", () => {
     expect(EVENT_STREAM_REPLAY_CONTRACT.sequenceScope).toBe("authenticated_principal");
     expect(EVENT_STREAM_REPLAY_CONTRACT.cursorExpiredHttpStatus).toBe(409);
     expect(EVENT_STREAM_REPLAY_CONTRACT.staleCursorRecovery).toBe(
-      "list_pending_then_reconnect_without_cursor",
+      "list_pending_watermark_then_reconnect_from_watermark",
     );
     expect(EVENT_STREAM_REPLAY_CONTRACT.authoritativeRecovery).toEqual([
       METHODS.LIST_PENDING_MESSAGES,
@@ -233,6 +238,10 @@ describe("principal-wide SSE topology and replay", () => {
     ]);
     expect(compareEventIds("41", "42")).toBeLessThan(0);
     const previous = PendingMessageEventSchema.parse({ ...event, eventId: "41" });
+    expect(eventsAfterCursor([event, previous], "0").map((item) => String(item.eventId))).toEqual([
+      "41",
+      "42",
+    ]);
     expect(eventsAfterCursor([previous, event], "41").map((item) => String(item.eventId))).toEqual([
       "42",
     ]);
@@ -247,7 +256,7 @@ describe("principal-wide SSE topology and replay", () => {
     expect(() => formatSseComment("bad\ncomment")).toThrow();
   });
 
-  test("requires recovery before a cursorless live connection and bounds cursor replay", () => {
+  test("requires a watermark for every live connection and accepts the zero-event boundary", () => {
     expect(
       EventStreamSubscriptionSchema.safeParse({
         principal,
@@ -257,6 +266,13 @@ describe("principal-wide SSE topology and replay", () => {
     expect(
       EventStreamSubscriptionSchema.safeParse({
         principal,
+        authoritativeRecoveryCompleted: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      EventStreamSubscriptionSchema.safeParse({
+        principal,
+        lastEventId: "0",
         authoritativeRecoveryCompleted: true,
       }).success,
     ).toBe(true);
@@ -315,6 +331,10 @@ describe("loopback connection and bearer provisioning", () => {
       TrustedConnectionConfigSchema.safeParse({
         endpoint: DEFAULT_BROKER_ENDPOINT,
         timeoutMs: 5_000,
+        autoStartBroker: true,
+        brokerStartupTimeoutMs: 5_000,
+        wakeOnMessage: true,
+        focusOnReceiveApproval: true,
         credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",
       }).success,
     ).toBe(true);
@@ -333,6 +353,30 @@ describe("loopback connection and bearer provisioning", () => {
       redirects: "forbidden",
       userinfoQueryFragment: "forbidden",
     });
+    expect(
+      TrustedConnectionConfigSchema.parse({
+        credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",
+      }),
+    ).toMatchObject({
+      autoStartBroker: true,
+      brokerStartupTimeoutMs: DEFAULT_BROKER_STARTUP_TIMEOUT_MS,
+      wakeOnMessage: false,
+      focusOnReceiveApproval: false,
+    });
+    expect(MIN_BROKER_STARTUP_TIMEOUT_MS).toBeGreaterThanOrEqual(100);
+    expect(MAX_BROKER_STARTUP_TIMEOUT_MS).toBeGreaterThan(DEFAULT_BROKER_STARTUP_TIMEOUT_MS);
+    expect(
+      TrustedConnectionConfigSchema.safeParse({
+        credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",
+        brokerStartupTimeoutMs: MIN_BROKER_STARTUP_TIMEOUT_MS - 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      TrustedConnectionConfigSchema.safeParse({
+        credentialFilePath: "/home/user/.config/opencode-agentbus/credential.json",
+        brokerStartupTimeoutMs: MAX_BROKER_STARTUP_TIMEOUT_MS + 1,
+      }).success,
+    ).toBe(false);
   });
 
   test("provisions 256-bit bearer credentials as secret out-of-band state", () => {
@@ -359,11 +403,28 @@ describe("loopback connection and bearer provisioning", () => {
     );
   });
 
-  test("freezes daemon lifecycle and rotation reconnect requirements", () => {
-    expect(BROKER_LIFECYCLE_CONTRACT.pluginProcessManagement).toBe("never_spawn_or_kill");
+  test("freezes persistent plugin-managed daemon lifecycle and rotation reconnect requirements", () => {
+    expect(BROKER_LIFECYCLE_CONTRACT).toEqual({
+      launch: "plugin_autostart_or_separately_launched_daemon",
+      pluginStartup: "authenticate_existing_then_spawn_bundled_cli_if_endpoint_unused",
+      processLifetime: "detached_user_process_survives_launching_opencode",
+      pluginDispose: "never_stop_broker",
+      listenerTakeover: "forbidden",
+      concurrency: "multiple_startups_converge_on_one_authenticated_listener",
+    });
     expect(TOKEN_ROTATION_CONTRACT).toEqual({
       action: "replace_token_and_invalidate_existing_connections",
       requiredRecovery: ["reconnect", "mcp_reinitialize", "reregister_sessions"],
+    });
+    expect(BROKER_CLI_EXIT_CODES).toEqual({
+      SUCCESS: 0,
+      FAILURE: 1,
+      LEASE_CONTENTION: 75,
+    });
+    expect(BROKER_CLI_EXIT_CONTRACT).toEqual({
+      leaseContentionMeaning: "another_broker_startup_owns_endpoint_lease",
+      leaseContentionDisposition: "poll_authenticated_readiness_until_existing_deadline",
+      nonContentionEarlyExitDisposition: "fail_fast_unavailable",
     });
   });
 });

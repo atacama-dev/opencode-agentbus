@@ -28,13 +28,35 @@ export const AuthChallengeProofSchema = z
   .brand<"AuthChallengeProof">();
 export type AuthChallengeProof = z.infer<typeof AuthChallengeProofSchema>;
 
-const AuthChallengeProofShape = {
-  protocolVersion: z.literal(PROTOCOL_VERSION),
+const AuthChallengeIdentityProofShape = {
   brokerId: BrokerIdSchema,
   serverId: ServerIdSchema,
   clientNonce: AuthChallengeNonceSchema,
   serverNonce: AuthChallengeNonceSchema,
 };
+
+const AuthChallengeProofShape = {
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  ...AuthChallengeIdentityProofShape,
+};
+
+const VersionedAuthChallengeProofInputSchema = z
+  .object({
+    protocolVersion: z.number().int().positive(),
+    ...AuthChallengeIdentityProofShape,
+  })
+  .strict()
+  .readonly();
+type VersionedAuthChallengeProofInput = z.infer<typeof VersionedAuthChallengeProofInputSchema>;
+
+const VersionedAuthChallengeResponseSchema = z
+  .object({
+    protocolVersion: z.number().int().positive(),
+    ...AuthChallengeIdentityProofShape,
+    proof: AuthChallengeProofSchema,
+  })
+  .strict()
+  .readonly();
 
 export const AuthChallengeProofInputSchema = z.object(AuthChallengeProofShape).strict().readonly();
 export type AuthChallengeProofInput = z.infer<typeof AuthChallengeProofInputSchema>;
@@ -63,7 +85,7 @@ export const AuthChallengeRequestSchema = z
 export type AuthChallengeRequest = z.infer<typeof AuthChallengeRequestSchema>;
 
 /** Domain UTF-8 bytes, NUL, then each ordered UTF-8 field prefixed by a 32-bit BE byte length. */
-function canonicalProofBytes(input: AuthChallengeProofInput): Uint8Array {
+function canonicalProofBytes(input: VersionedAuthChallengeProofInput): Uint8Array {
   const encoder = new TextEncoder();
   const fields = [
     String(input.protocolVersion),
@@ -118,6 +140,18 @@ export function createAuthChallengeProof(
   return AuthChallengeProofSchema.parse(proof);
 }
 
+function createVersionedAuthChallengeProof(
+  token: string,
+  input: VersionedAuthChallengeProofInput,
+): AuthChallengeProof {
+  const parsed = VersionedAuthChallengeProofInputSchema.parse(input);
+  const encoded = canonicalProofBytes(parsed);
+  const proof = createHmac("sha256", decodedBearerKey(token))
+    .update(new DataView(encoded.buffer, encoded.byteOffset, encoded.byteLength))
+    .digest("hex");
+  return AuthChallengeProofSchema.parse(proof);
+}
+
 function constantTimeProofEqual(left: AuthChallengeProof, right: AuthChallengeProof): boolean {
   const leftBytes = Uint8Array.from(Buffer.from(left, "hex"));
   const rightBytes = Uint8Array.from(Buffer.from(right, "hex"));
@@ -150,6 +184,33 @@ export function verifyAuthChallengeResponse(input: VerifyAuthChallengeResponseIn
   const proofMatches = constantTimeProofEqual(expectedProof, response.data.proof);
   return (
     proofMatches &&
+    response.data.serverId === serverId.data &&
+    response.data.clientNonce === clientNonce.data
+  );
+}
+
+/** Authenticates a known incompatible listener version without accepting it for normal use. */
+export function verifyAuthChallengeResponseVersion(
+  input: VerifyAuthChallengeResponseInput,
+  expectedProtocolVersion: number,
+): boolean {
+  const token = BearerTokenSchema.safeParse(input.token);
+  const serverId = ServerIdSchema.safeParse(input.expectedServerId);
+  const clientNonce = AuthChallengeNonceSchema.safeParse(input.expectedClientNonce);
+  const response = VersionedAuthChallengeResponseSchema.safeParse(input.response);
+  if (
+    !token.success ||
+    !serverId.success ||
+    !clientNonce.success ||
+    !response.success ||
+    response.data.protocolVersion !== expectedProtocolVersion
+  ) {
+    return false;
+  }
+  const { proof: _proof, ...proofInput } = response.data;
+  const expectedProof = createVersionedAuthChallengeProof(token.data, proofInput);
+  return (
+    constantTimeProofEqual(expectedProof, response.data.proof) &&
     response.data.serverId === serverId.data &&
     response.data.clientNonce === clientNonce.data
   );

@@ -13,6 +13,8 @@ import {
   ERROR_MESSAGES,
   EnqueueMessageRequestSchema,
   EXPIRY_SEMANTICS,
+  ForegroundIdentityRequestSchema,
+  ForegroundIdentityResponseSchema,
   HandshakeRequestSchema,
   ListPendingMessagesRequestSchema,
   ListPendingMessagesResultSchema,
@@ -103,13 +105,15 @@ function requestBase(method: string) {
 
 describe("versioned transport contract", () => {
   test("freezes protocol version, method names, and loopback authenticated transports", () => {
-    expect(PROTOCOL_VERSION).toBe(1);
+    expect(PROTOCOL_VERSION).toBe(2);
     expect(METHODS).toEqual({
       HANDSHAKE: "agentbus.handshake",
       REGISTER_SESSION: "agentbus.session.register",
+      RESOLVE_FOREGROUND_SESSION: "agentbus.session.resolve_foreground",
       HEARTBEAT_SESSION: "agentbus.session.heartbeat",
       DEREGISTER_SESSION: "agentbus.session.deregister",
       ENQUEUE_MESSAGE: "agentbus.message.enqueue",
+      REPLY_MESSAGE: "agentbus.message.reply",
       PEEK_NEXT_MESSAGE: "agentbus.message.peek_next",
       LIST_PENDING_MESSAGES: "agentbus.message.list_pending",
       CONSUME_MESSAGE: "agentbus.message.consume",
@@ -127,25 +131,25 @@ describe("versioned transport contract", () => {
     expect(TRANSPORT_CONTRACT.events.authentication).toBe("bearer_client_principal");
   });
 
-  test("handshake negotiates only version 1 and fails closed otherwise", () => {
+  test("handshake negotiates only version 2 and rejects strict version-1 traffic", () => {
     const supported = HandshakeRequestSchema.parse({
       protocolVersion: PROTOCOL_VERSION,
       requestId,
       method: METHODS.HANDSHAKE,
-      params: { supportedProtocolVersions: [1] },
+      params: { supportedProtocolVersions: [2] },
     });
     const incompatible = HandshakeRequestSchema.parse({
       protocolVersion: PROTOCOL_VERSION,
       requestId,
       method: METHODS.HANDSHAKE,
-      params: { supportedProtocolVersions: [2] },
+      params: { supportedProtocolVersions: [1] },
     });
 
     const accepted = negotiateProtocolVersion(supported, "broker_01", principal);
     const rejected = negotiateProtocolVersion(incompatible, "broker_01", principal);
     expect(accepted.ok).toBe(true);
     if (accepted.ok) {
-      expect(accepted.protocolVersion).toBe(1);
+      expect(accepted.protocolVersion).toBe(2);
       expect(accepted.requestId as string).toBe(requestId);
       expect(accepted.result.broker.serverId).toBe(principal.serverId);
     }
@@ -153,7 +157,7 @@ describe("versioned transport contract", () => {
     expect(
       EnqueueMessageRequestSchema.safeParse({
         ...requestBase(METHODS.ENQUEUE_MESSAGE),
-        protocolVersion: 2,
+        protocolVersion: 1,
         params: { source, target, body: "hello", ttlSeconds: 60 },
       }).success,
     ).toBe(false);
@@ -176,6 +180,38 @@ describe("versioned transport contract", () => {
 });
 
 describe("principal-bound registration lifecycle", () => {
+  test("foreground identity resolution is strict and explicitly non-activating", () => {
+    const request = ForegroundIdentityRequestSchema.parse({
+      ...requestBase(METHODS.RESOLVE_FOREGROUND_SESSION),
+      params: {
+        hostSessionId: "host_foreground",
+        metadata: { title: "Trusted current session" },
+      },
+    });
+
+    expect(request.params.hostSessionId as string).toBe("host_foreground");
+    expect(
+      ForegroundIdentityRequestSchema.safeParse({
+        ...request,
+        params: { ...request.params, source: source, target, body: "peer-controlled" },
+      }).success,
+    ).toBe(false);
+    expect(
+      ForegroundIdentityResponseSchema.safeParse({
+        protocolVersion: PROTOCOL_VERSION,
+        requestId,
+        ok: true,
+        result: {
+          hostSessionId: "host_foreground",
+          identity: source,
+          fingerprint: sessionFingerprint(source),
+          metadata: { title: "Trusted current session" },
+          leaseSeconds: DEFAULT_SESSION_LEASE_SECONDS,
+        },
+      }).success,
+    ).toBe(true);
+  });
+
   test("principal context is out-of-band and rejects bearer secrets", () => {
     expect(
       AuthenticatedClientPrincipalSchema.safeParse({
@@ -194,7 +230,7 @@ describe("principal-bound registration lifecycle", () => {
       request: {
         requestId,
         method: METHODS.REGISTER_SESSION,
-        protocolVersion: 1,
+        protocolVersion: PROTOCOL_VERSION,
         params: {
           hostSessionId: "host_session_01",
           optIn: true,
@@ -226,6 +262,9 @@ describe("principal-bound registration lifecycle", () => {
     expect(REGISTRATION_SEMANTICS.reregistration).toContain("same canonical identity");
     expect(
       registrationResultMatchesInput(input, { ...result, registration: "refreshed" }, result),
+    ).toBe(true);
+    expect(
+      registrationResultMatchesInput(input, { ...result, registration: "deferred" }, result),
     ).toBe(true);
     expect(
       registrationResultMatchesInput(
@@ -291,7 +330,7 @@ describe("principal-bound registration lifecycle", () => {
 describe("metadata-only notifications and pending recovery", () => {
   test("pending SSE events contain no peer-controlled display or content fields", () => {
     const eventInput = {
-      protocolVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
       event: PENDING_MESSAGE_EVENT_TYPE,
       eventId: "1",
       correlationId: requestId,
@@ -339,6 +378,7 @@ describe("metadata-only notifications and pending recovery", () => {
     const result = ListPendingMessagesResultSchema.parse({
       target,
       requestedLimit: 20,
+      eventCursor: "0",
       headers: [first, second],
     });
     expect(listPendingResultMatchesRequest(request, result)).toBe(true);
@@ -346,7 +386,15 @@ describe("metadata-only notifications and pending recovery", () => {
       ListPendingMessagesResultSchema.safeParse({
         target,
         requestedLimit: 20,
+        eventCursor: "0",
         headers: [second, first],
+      }).success,
+    ).toBe(false);
+    expect(
+      ListPendingMessagesResultSchema.safeParse({
+        target,
+        requestedLimit: 20,
+        headers: [first, second],
       }).success,
     ).toBe(false);
     expect(comparePendingHeaders(first, second)).toBeLessThan(0);

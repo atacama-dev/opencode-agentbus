@@ -3,22 +3,27 @@ import {
   MIN_SESSION_LEASE_SECONDS,
   PROTOCOL_VERSION,
 } from "./constants";
-import { hashNormalizedSearchQuery, sessionFingerprint } from "./crypto";
+import { bodySha256, hashNormalizedSearchQuery, sessionFingerprint } from "./crypto";
+import { utf8Bytes } from "./unicode";
 import { PeerMessagePresentationSchema, RegistrationResultSchema } from "./schemas";
 import type {
   ConsumedMessageResult,
+  EnqueueMessageReceipt,
   PeerMessagePresentation,
   PendingMessageHeader,
   PrincipalSessionBinding,
+  ReplyMessageReceipt,
   SessionIdentity,
 } from "./schemas";
 import type {
   AuthenticatedRegisterOperationInput,
   ConsumeMessageRequest,
+  EnqueueMessageRequest,
   ListPendingMessagesRequest,
   ListPendingMessagesResult,
   PendingMessageEvent,
   RejectMessageRequest,
+  ReplyMessageRequest,
   SearchSessionsRequest,
   SearchSessionsResult,
 } from "./transport";
@@ -81,7 +86,30 @@ export function consumedResultMatchesHeader(
     sameSessionIdentity(result.source, header.source) &&
     sameSessionIdentity(result.target, header.target) &&
     result.bodyHash === header.bodyHash &&
-    result.bodyBytes === header.bodyBytes
+    result.bodyBytes === header.bodyBytes &&
+    result.replyToMessageId === header.replyToMessageId
+  );
+}
+
+export function replyResultMatchesRequest(
+  request: ReplyMessageRequest,
+  result: ReplyMessageReceipt,
+): boolean {
+  return (
+    result.replyToMessageId === request.params.messageId &&
+    result.messageId !== request.params.messageId &&
+    result.bodyHash === bodySha256(request.params.body) &&
+    result.bodyBytes === utf8Bytes(request.params.body)
+  );
+}
+
+export function enqueueResultMatchesRequest(
+  request: EnqueueMessageRequest,
+  result: EnqueueMessageReceipt,
+): boolean {
+  return (
+    result.bodyHash === bodySha256(request.params.body) &&
+    result.bodyBytes === utf8Bytes(request.params.body)
   );
 }
 

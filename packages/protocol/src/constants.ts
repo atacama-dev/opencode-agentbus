@@ -1,11 +1,13 @@
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
 
 export const METHODS = Object.freeze({
   HANDSHAKE: "agentbus.handshake",
   REGISTER_SESSION: "agentbus.session.register",
+  RESOLVE_FOREGROUND_SESSION: "agentbus.session.resolve_foreground",
   HEARTBEAT_SESSION: "agentbus.session.heartbeat",
   DEREGISTER_SESSION: "agentbus.session.deregister",
   ENQUEUE_MESSAGE: "agentbus.message.enqueue",
+  REPLY_MESSAGE: "agentbus.message.reply",
   PEEK_NEXT_MESSAGE: "agentbus.message.peek_next",
   LIST_PENDING_MESSAGES: "agentbus.message.list_pending",
   CONSUME_MESSAGE: "agentbus.message.consume",
@@ -19,6 +21,9 @@ export type Method = (typeof METHODS)[keyof typeof METHODS];
 export const PENDING_MESSAGE_EVENT_TYPE = "agentbus.pending" as const;
 
 export const DEFAULT_BROKER_ENDPOINT = "http://127.0.0.1:4097" as const;
+export const MIN_BROKER_STARTUP_TIMEOUT_MS = 100;
+export const MAX_BROKER_STARTUP_TIMEOUT_MS = 30_000;
+export const DEFAULT_BROKER_STARTUP_TIMEOUT_MS = 5_000;
 
 export const AUTH_CHALLENGE_ENDPOINT = "/auth/challenge" as const;
 export const AUTH_CHALLENGE_CLIENT_NONCE_HEADER = "X-AgentBus-Client-Nonce" as const;
@@ -114,7 +119,7 @@ export const TRANSPORT_CONTRACT = Object.freeze({
 export const SSE_RECONNECT_SEMANTICS = Object.freeze({
   delivery: "best_effort",
   eventId: "monotonic_per_authenticated_principal_stream",
-  lastEventId: "advisory_resume_cursor",
+  lastEventId: "authoritative_replay_watermark_including_zero",
   authoritativeRecovery: Object.freeze([METHODS.LIST_PENDING_MESSAGES, METHODS.PEEK_NEXT_MESSAGE]),
 } as const);
 
@@ -126,9 +131,9 @@ export const EVENT_STREAM_REPLAY_CONTRACT = Object.freeze({
   connectionScope: "one_connection_receives_all_active_targets_owned_by_principal",
   delivery: "hint_only_best_effort",
   cursorReplay: "valid_cursor_replays_events_strictly_after_cursor",
-  missingCursor: "list_pending_recovery_then_connect_live",
+  missingCursor: "rejected_event_stream_subscription",
   staleOrUnknownCursor: "EVENT_CURSOR_EXPIRED",
-  staleCursorRecovery: "list_pending_then_reconnect_without_cursor",
+  staleCursorRecovery: "list_pending_watermark_then_reconnect_from_watermark",
   cursorExpiredHttpStatus: 409,
   cursorErrorBody: "canonical_application_error_envelope",
   cursorErrorRequestId: "broker_generated_safe_correlation_id",
@@ -137,8 +142,24 @@ export const EVENT_STREAM_REPLAY_CONTRACT = Object.freeze({
 } as const);
 
 export const BROKER_LIFECYCLE_CONTRACT = Object.freeze({
-  launch: "separately_launched_daemon",
-  pluginProcessManagement: "never_spawn_or_kill",
+  launch: "plugin_autostart_or_separately_launched_daemon",
+  pluginStartup: "authenticate_existing_then_spawn_bundled_cli_if_endpoint_unused",
+  processLifetime: "detached_user_process_survives_launching_opencode",
+  pluginDispose: "never_stop_broker",
+  listenerTakeover: "forbidden",
+  concurrency: "multiple_startups_converge_on_one_authenticated_listener",
+} as const);
+
+export const BROKER_CLI_EXIT_CODES = Object.freeze({
+  SUCCESS: 0,
+  FAILURE: 1,
+  LEASE_CONTENTION: 75,
+} as const);
+
+export const BROKER_CLI_EXIT_CONTRACT = Object.freeze({
+  leaseContentionMeaning: "another_broker_startup_owns_endpoint_lease",
+  leaseContentionDisposition: "poll_authenticated_readiness_until_existing_deadline",
+  nonContentionEarlyExitDisposition: "fail_fast_unavailable",
 } as const);
 
 export const CREDENTIAL_FILE_MODE = 0o600;
@@ -234,6 +255,7 @@ export const ERROR_CODES = [
   "SESSION_NOT_REGISTERED",
   "TARGET_NOT_REGISTERED",
   "MESSAGE_NOT_FOUND",
+  "MESSAGE_NOT_REPLYABLE",
   "MESSAGE_NOT_PENDING",
   "MESSAGE_TOO_LARGE",
   "MESSAGE_EXPIRED",
@@ -256,6 +278,7 @@ export const ERROR_MESSAGES: Readonly<Record<ErrorCode, string>> = Object.freeze
   SESSION_NOT_REGISTERED: "The source session is not registered.",
   TARGET_NOT_REGISTERED: "The target session is not registered.",
   MESSAGE_NOT_FOUND: "The message does not exist.",
+  MESSAGE_NOT_REPLYABLE: "The message cannot be replied to.",
   MESSAGE_NOT_PENDING: "The message is no longer pending.",
   MESSAGE_TOO_LARGE: "The message exceeds the configured size limit.",
   MESSAGE_EXPIRED: "The message has expired.",
@@ -276,6 +299,7 @@ export const HTTP_STATUS_BY_ERROR_CODE: Readonly<Record<ErrorCode, number>> = Ob
   SESSION_NOT_REGISTERED: 404,
   TARGET_NOT_REGISTERED: 404,
   MESSAGE_NOT_FOUND: 404,
+  MESSAGE_NOT_REPLYABLE: 409,
   MESSAGE_NOT_PENDING: 409,
   MESSAGE_TOO_LARGE: 413,
   MESSAGE_EXPIRED: 409,
@@ -288,9 +312,11 @@ export const HTTP_STATUS_BY_ERROR_CODE: Readonly<Record<ErrorCode, number>> = Ob
 });
 
 export const OPERATION_OWNERSHIP_CLAIMS = Object.freeze({
+  [METHODS.RESOLVE_FOREGROUND_SESSION]: "params.hostSessionId",
   [METHODS.HEARTBEAT_SESSION]: "params.session",
   [METHODS.DEREGISTER_SESSION]: "params.session",
   [METHODS.ENQUEUE_MESSAGE]: "params.source",
+  [METHODS.REPLY_MESSAGE]: "params.source",
   [METHODS.PEEK_NEXT_MESSAGE]: "params.target",
   [METHODS.LIST_PENDING_MESSAGES]: "params.target",
   [METHODS.CONSUME_MESSAGE]: "params.target",

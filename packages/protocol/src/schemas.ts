@@ -23,6 +23,7 @@ import {
   MIN_RETRY_AFTER_MS,
   MAX_RETRY_AFTER_MS,
   MIN_SESSION_LEASE_SECONDS,
+  PROTOCOL_VERSION,
   SAFE_ID_PATTERN,
 } from "./constants";
 import { isWellFormedUnicode, utf8Bytes } from "./unicode";
@@ -75,6 +76,12 @@ export const EventIdSchema = z
   .regex(/^[1-9][0-9]{0,19}$/, "event ID must be a positive decimal sequence")
   .brand<"EventId">();
 export type EventId = z.infer<typeof EventIdSchema>;
+
+export const EventCursorSchema = z
+  .string()
+  .regex(/^(0|[1-9][0-9]{0,19})$/, "event cursor must be a non-negative decimal sequence")
+  .brand<"EventCursor">();
+export type EventCursor = z.infer<typeof EventCursorSchema>;
 
 export const PrincipalIdSchema = SafeOpaqueIdSchema.brand<"PrincipalId">();
 export type PrincipalId = z.infer<typeof PrincipalIdSchema>;
@@ -203,6 +210,19 @@ function enforceSameBrokerScope(
   }
 }
 
+function enforceDistinctReplyLink(
+  message: { messageId: string; replyToMessageId?: string | undefined },
+  context: z.RefinementCtx,
+): void {
+  if (message.replyToMessageId !== undefined && message.messageId === message.replyToMessageId) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["replyToMessageId"],
+      message: "reply linkage must reference a different message",
+    });
+  }
+}
+
 export const EnqueueMessageReceiptSchema = z
   .object({
     messageId: MessageIdSchema,
@@ -215,9 +235,24 @@ export const EnqueueMessageReceiptSchema = z
   .readonly();
 export type EnqueueMessageReceipt = z.infer<typeof EnqueueMessageReceiptSchema>;
 
+export const ReplyMessageReceiptSchema = z
+  .object({
+    messageId: MessageIdSchema,
+    replyToMessageId: MessageIdSchema,
+    state: z.literal("PENDING"),
+    bodyHash: BodyHashSchema,
+    bodyBytes: BodyBytesSchema,
+    expiresAt: TimestampSchema,
+  })
+  .strict()
+  .superRefine(enforceDistinctReplyLink)
+  .readonly();
+export type ReplyMessageReceipt = z.infer<typeof ReplyMessageReceiptSchema>;
+
 export const PendingMessageHeaderSchema = z
   .object({
     messageId: MessageIdSchema,
+    replyToMessageId: MessageIdSchema.optional(),
     source: SessionIdentitySchema,
     target: SessionIdentitySchema,
     bodyHash: BodyHashSchema,
@@ -228,6 +263,7 @@ export const PendingMessageHeaderSchema = z
   })
   .strict()
   .superRefine((header, context) => {
+    enforceDistinctReplyLink(header, context);
     enforceSameBrokerScope(header, context);
     if (Date.parse(header.expiresAt) <= Date.parse(header.enqueuedAt)) {
       context.addIssue({
@@ -254,6 +290,7 @@ export type ReceivePermissionMetadata = z.infer<typeof ReceivePermissionMetadata
 
 const ConsumedMessageShape = {
   messageId: MessageIdSchema,
+  replyToMessageId: MessageIdSchema.optional(),
   source: SessionIdentitySchema,
   target: SessionIdentitySchema,
   body: MessageBodySchema,
@@ -265,6 +302,8 @@ const ConsumedMessageShape = {
 
 function enforceConsumedBodyIntegrity(
   message: {
+    messageId: string;
+    replyToMessageId?: string | undefined;
     source: SessionIdentity;
     target: SessionIdentity;
     body: string;
@@ -273,6 +312,7 @@ function enforceConsumedBodyIntegrity(
   },
   context: z.RefinementCtx,
 ): void {
+  enforceDistinctReplyLink(message, context);
   enforceSameBrokerScope(message, context);
   if (utf8Bytes(message.body) !== message.bodyBytes) {
     context.addIssue({
@@ -318,7 +358,7 @@ export const RegistrationResultSchema = z
     identity: SessionIdentitySchema,
     fingerprint: SessionFingerprintSchema,
     metadata: SessionMetadataSchema,
-    registration: z.enum(["created", "refreshed"]),
+    registration: z.enum(["created", "refreshed", "deferred"]),
     leaseSeconds: SessionLeaseSecondsSchema,
     leaseExpiresAt: TimestampSchema,
   })
@@ -383,7 +423,7 @@ const ErrorMessageSchema = safeDisplayString(MAX_ERROR_MESSAGE_BYTES, "error mes
 
 export const ErrorEnvelopeSchema = z
   .object({
-    protocolVersion: z.literal(1),
+    protocolVersion: z.literal(PROTOCOL_VERSION),
     requestId: RequestIdSchema,
     ok: z.literal(false),
     error: z
