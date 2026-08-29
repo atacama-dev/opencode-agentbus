@@ -26,7 +26,7 @@ describe("registration churn accounting", () => {
     }
   });
 
-  test("supports one complete 256-session bootstrap and rejects the next create", () => {
+  test("supports one complete 256-session bootstrap and defers the next create", () => {
     const harness = createHarness();
     try {
       for (let index = 0; index < 256; index += 1) {
@@ -41,13 +41,18 @@ describe("registration churn accounting", () => {
         sessions: 256,
         registrationRateRows: 256,
       });
-      expectError(
+      expectSuccess(
         harness.service.dispatch(
           harness.service.principal,
           registerRequest("full-bootstrap-over-limit"),
         ),
-        "RATE_LIMITED",
       );
+      expect(harness.service.storageStatsForTesting()).toMatchObject({
+        sessions: 257,
+        activeSessions: 256,
+        displacedSessions: 1,
+        registrationRateRows: 256,
+      });
     } finally {
       harness.close();
     }

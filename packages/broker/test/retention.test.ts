@@ -21,8 +21,9 @@ describe("persistent retention and quotas", () => {
   test("enforces total session, message, and registration churn quotas", () => {
     const harness = createHarness({
       limits: {
-        maxSessionsPerPrincipal: 2,
-        maxSessionsGlobal: 2,
+        maxSessionsPerPrincipal: 3,
+        maxSessionsGlobal: 3,
+        foregroundSessionReserve: 1,
         maxMessagesPerPrincipal: 1,
         maxMessagesGlobal: 1,
         registrationsPerPrincipalPerMinute: 4,
@@ -202,8 +203,9 @@ describe("persistent retention and quotas", () => {
   test("persists total quotas and registration churn accounting across restart", () => {
     const harness = createHarness({
       limits: {
-        maxSessionsPerPrincipal: 2,
-        maxSessionsGlobal: 2,
+        maxSessionsPerPrincipal: 3,
+        maxSessionsGlobal: 3,
+        foregroundSessionReserve: 1,
         maxMessagesPerPrincipal: 1,
         maxMessagesGlobal: 1,
         registrationsPerPrincipalPerMinute: 2,
@@ -230,8 +232,9 @@ describe("persistent retention and quotas", () => {
         clock: harness.clock,
         random: harness.random,
         limits: {
-          maxSessionsPerPrincipal: 2,
-          maxSessionsGlobal: 2,
+          maxSessionsPerPrincipal: 3,
+          maxSessionsGlobal: 3,
+          foregroundSessionReserve: 1,
           maxMessagesPerPrincipal: 1,
           maxMessagesGlobal: 1,
           registrationsPerPrincipalPerMinute: 2,
@@ -354,7 +357,7 @@ describe("ordered schema migrations", () => {
   test("initializes fresh state and preserves the supported schema across restart", () => {
     const harness = createHarness();
     try {
-      expect(harness.service.schemaVersionForTesting()).toBe(3);
+      expect(harness.service.schemaVersionForTesting()).toBe(5);
       harness.service.close();
       const restarted = BrokerService.open({
         databasePath: harness.databasePath,
@@ -363,7 +366,7 @@ describe("ordered schema migrations", () => {
         random: harness.random,
       });
       try {
-        expect(restarted.schemaVersionForTesting()).toBe(3);
+        expect(restarted.schemaVersionForTesting()).toBe(5);
       } finally {
         restarted.close();
       }
@@ -377,6 +380,10 @@ describe("ordered schema migrations", () => {
     try {
       harness.service.close();
       const database = new Database(harness.databasePath);
+      database.run("DROP INDEX IF EXISTS sessions_admission_idx");
+      database.run("ALTER TABLE sessions DROP COLUMN last_foreground_ms");
+      database.run("ALTER TABLE sessions DROP COLUMN displaced");
+      database.run("ALTER TABLE messages DROP COLUMN reply_to_message_id");
       database.run("DROP TABLE IF EXISTS registration_rate");
       database.run("PRAGMA user_version = 1");
       database.close();
@@ -389,7 +396,7 @@ describe("ordered schema migrations", () => {
         random: harness.random,
       });
       try {
-        expect(migrated.schemaVersionForTesting()).toBe(3);
+        expect(migrated.schemaVersionForTesting()).toBe(5);
         expectSuccess(migrated.dispatch(migrated.principal, registerRequest("migrated")));
       } finally {
         migrated.close();

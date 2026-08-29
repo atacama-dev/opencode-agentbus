@@ -48,6 +48,7 @@ interface McpContext {
   readonly server: Server;
   sessionId?: string;
   initialized: boolean;
+  applicationHandshakeComplete: boolean;
   lastUsedMs: number;
   inFlight: number;
   closing: boolean;
@@ -184,6 +185,7 @@ export class BrokerDaemon {
   private readonly mcpSessions = new Map<string, McpContext>();
   private readonly mcpContexts = new Set<McpContext>();
   private readonly eventConnections = new Set<EventConnection>();
+  private applicationHandshakeComplete = false;
   private listener: ReturnType<typeof Bun.serve> | undefined;
   private reapTimer: ReturnType<typeof setInterval> | undefined;
   private maintenanceTimer: ReturnType<typeof setInterval> | undefined;
@@ -308,6 +310,7 @@ export class BrokerDaemon {
     this.rotating = true;
     try {
       await this.closeConnections();
+      this.applicationHandshakeComplete = false;
       return this.service.rotateCredential();
     } finally {
       this.rotating = false;
@@ -323,9 +326,10 @@ export class BrokerDaemon {
     this.maintenanceTimer = undefined;
     this.authChallengeTokens = this.maxAuthChallengesPerMinute;
     this.authChallengeLastRefillMs = this.clock.now();
+    this.applicationHandshakeComplete = false;
     const listener = this.listener;
     this.listener = undefined;
-    const stopped = listener?.stop(false);
+    const stopped = listener?.stop(true);
     await this.closeConnections();
     await stopped;
     this.service.close();
@@ -509,6 +513,7 @@ export class BrokerDaemon {
       transport,
       server,
       initialized: false,
+      applicationHandshakeComplete: false,
       lastUsedMs: this.clock.now(),
       inFlight: 0,
       closing: false,
@@ -525,6 +530,9 @@ export class BrokerDaemon {
       server.setRequestHandler(customRequestSchema(method), (request, extra) => {
         if (!context.initialized) {
           throw new McpError(ErrorCode.InvalidRequest, "MCP initialization is incomplete.");
+        }
+        if (method !== METHODS.HANDSHAKE && !context.applicationHandshakeComplete) {
+          throw new McpError(ErrorCode.InvalidRequest, "Agent Bus handshake is incomplete.");
         }
         const outerRequestId = RequestIdSchema.safeParse(extra.requestId);
         const applicationRequest = request.params;
@@ -547,7 +555,12 @@ export class BrokerDaemon {
           if (!response.ok && response.error.code === "INVALID_REQUEST") return response;
           throw new McpError(ErrorCode.InvalidRequest, "Invalid custom JSON-RPC request.");
         }
-        return this.service.dispatch(principal, wire.data.params);
+        const response = this.service.dispatch(principal, wire.data.params);
+        if (method === METHODS.HANDSHAKE && response.ok) {
+          context.applicationHandshakeComplete = true;
+          this.applicationHandshakeComplete = true;
+        }
+        return response;
       });
     }
     this.mcpContexts.add(context);
@@ -579,6 +592,7 @@ export class BrokerDaemon {
     if (!request.headers.get("accept")?.includes(SSE_HTTP_CONTRACT.accept)) {
       return plainError(406);
     }
+    if (!this.applicationHandshakeComplete) return plainError(409);
     const principalConnections = [...this.eventConnections].filter((connection) =>
       principalsEqual(connection.principal, principal),
     ).length;
@@ -590,7 +604,7 @@ export class BrokerDaemon {
     };
     const unsubscribe = this.service.subscribeEvents(principal, (event) => deliver(event));
     const cursor = request.headers.get(SSE_HTTP_CONTRACT.cursorHeader) ?? undefined;
-    const replay = this.service.replayEvents(principal, cursor);
+    const replay = this.service.replayEvents(principal, cursor ?? "");
     if (!replay.ok) {
       unsubscribe();
       return new Response(JSON.stringify(replay.error), {

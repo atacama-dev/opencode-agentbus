@@ -93,6 +93,23 @@ async function customRequest(
   return { response, wire: (await response.json()) as Record<string, unknown> };
 }
 
+async function completeApplicationHandshake(
+  endpoint: string,
+  credential: CredentialFile,
+): Promise<McpSession> {
+  const session = await initialize(endpoint, credential);
+  const handshake = await customRequest(endpoint, credential, session, {
+    protocolVersion: PROTOCOL_VERSION,
+    requestId: requestId("event-handshake"),
+    method: METHODS.HANDSHAKE,
+    params: { supportedProtocolVersions: [PROTOCOL_VERSION] },
+  });
+  if ((handshake.wire.result as { ok?: boolean }).ok !== true) {
+    throw new Error("Application handshake failed.");
+  }
+  return session;
+}
+
 function initializeBody(id: string): string {
   return JSON.stringify({
     jsonrpc: "2.0",
@@ -113,6 +130,7 @@ function eventRequest(endpoint: string, credential: CredentialFile): Request {
       Accept: "text/event-stream",
       Authorization: `Bearer ${credential.token}`,
       Host: host,
+      "Last-Event-ID": "0",
     },
   });
 }
@@ -235,6 +253,57 @@ describe("local MCP daemon", () => {
     expect(JSON.stringify(unsupported.wire)).toContain("UNSUPPORTED_PROTOCOL_VERSION");
   });
 
+  test("rejects a version-1 client and all operations until a version-2 handshake succeeds", async () => {
+    harness = createHarness();
+    daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
+    const endpoint = await daemon.start();
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const session = await initialize(endpoint, credential);
+
+    const legacyHandshake = await customRequest(endpoint, credential, session, {
+      protocolVersion: 1,
+      requestId: requestId("legacy-handshake"),
+      method: METHODS.HANDSHAKE,
+      params: { supportedProtocolVersions: [1] },
+    });
+    expect(JSON.stringify(legacyHandshake.wire)).toContain("INVALID_REQUEST");
+    expect(harness.service.storageStatsForTesting().sessions).toBe(0);
+
+    const eventsBeforeHandshake = await daemon.handleRequest(eventRequest(endpoint, credential));
+    expect(eventsBeforeHandshake.status).toBe(409);
+    expect(daemon.connectionCounts().sse).toBe(0);
+
+    const beforeHandshake = await customRequest(
+      endpoint,
+      credential,
+      session,
+      registerRequest("must-not-register-before-v2-handshake"),
+    );
+    expect(beforeHandshake.wire.error).toBeDefined();
+    expect(harness.service.storageStatsForTesting().sessions).toBe(0);
+
+    const handshake = await customRequest(endpoint, credential, session, {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: requestId("v2-handshake"),
+      method: METHODS.HANDSHAKE,
+      params: { supportedProtocolVersions: [PROTOCOL_VERSION] },
+    });
+    expect((handshake.wire.result as { ok?: boolean }).ok).toBe(true);
+    const eventsAfterHandshake = await daemon.handleRequest(eventRequest(endpoint, credential));
+    expect(eventsAfterHandshake.status).toBe(200);
+    await eventsAfterHandshake.body?.cancel();
+    const registered = await customRequest(
+      endpoint,
+      credential,
+      session,
+      registerRequest("register-after-v2-handshake"),
+    );
+    expect((registered.wire.result as { ok?: boolean }).ok).toBe(true);
+    expect(harness.service.storageStatsForTesting().sessions).toBe(1);
+  });
+
   test("rotating credentials invalidates existing MCP sessions", async () => {
     harness = createHarness();
     daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
@@ -338,6 +407,7 @@ describe("local MCP daemon", () => {
     const credential = CredentialFileSchema.parse(
       JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
     );
+    await completeApplicationHandshake(endpoint, credential);
 
     const first = await daemon.handleRequest(eventRequest(endpoint, credential));
     expect(first.status).toBe(200);
@@ -366,6 +436,7 @@ describe("local MCP daemon", () => {
     const credential = CredentialFileSchema.parse(
       JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
     );
+    await completeApplicationHandshake(endpoint, credential);
     const source = expectSuccess<RegistrationResult>(
       harness.service.dispatch(harness.service.principal, registerRequest("slow-source")),
     );
@@ -404,16 +475,29 @@ describe("local MCP daemon", () => {
     const credential = CredentialFileSchema.parse(
       JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
     );
+    const sourceSession = await initialize(endpoint, credential);
+    await customRequest(endpoint, credential, sourceSession, {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: requestId("source-handshake"),
+      method: METHODS.HANDSHAKE,
+      params: { supportedProtocolVersions: [PROTOCOL_VERSION] },
+    });
     const sourceWire = await customRequest(
       endpoint,
       credential,
-      await initialize(endpoint, credential),
+      sourceSession,
       registerRequest("source"),
     );
     const session = {
       // A second connection is intentional: principal-wide events are independent of MCP sessions.
       ...(await initialize(endpoint, credential)),
     };
+    await customRequest(endpoint, credential, session, {
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: requestId("target-handshake"),
+      method: METHODS.HANDSHAKE,
+      params: { supportedProtocolVersions: [PROTOCOL_VERSION] },
+    });
     const targetWire = await customRequest(
       endpoint,
       credential,
@@ -422,6 +506,35 @@ describe("local MCP daemon", () => {
     );
     const source = (sourceWire.wire.result as { result: RegistrationResult }).result;
     const target = (targetWire.wire.result as { result: RegistrationResult }).result;
+
+    const liveResponse = await fetch(`${endpoint}/events`, {
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${credential.token}`,
+        "Last-Event-ID": "0",
+      },
+      redirect: "error",
+    });
+    expect(liveResponse.status).toBe(200);
+    await customRequest(
+      endpoint,
+      credential,
+      session,
+      enqueueRequest(source.identity, target.identity, "first-live-body"),
+    );
+    const liveReader = liveResponse.body?.getReader();
+    let liveText = "";
+    for (
+      let attempt = 0;
+      attempt < 10 && !liveText.includes("event: agentbus.pending");
+      attempt += 1
+    ) {
+      const liveChunk = await liveReader?.read();
+      liveText += new TextDecoder().decode(liveChunk?.value);
+    }
+    await liveReader?.cancel();
+    expect(liveText).toContain("id: 1\nevent: agentbus.pending");
+    expect(liveText).not.toContain("first-live-body");
 
     const bodies = ["SSE_BODY_SECRET", "second", "third"];
     for (const body of bodies) {
@@ -457,17 +570,28 @@ describe("local MCP daemon", () => {
       headers: {
         Accept: "text/event-stream",
         Authorization: `Bearer ${credential.token}`,
-        "Last-Event-ID": "1",
+        "Last-Event-ID": String(Number(retained[0]?.eventId ?? "3") - 1),
       },
       redirect: "error",
     });
     expect(staleResponse.status).toBe(409);
     expect(JSON.stringify(await staleResponse.json())).toContain("EVENT_CURSOR_EXPIRED");
 
+    const missingCursorResponse = await fetch(`${endpoint}/events`, {
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${credential.token}`,
+      },
+      redirect: "error",
+    });
+    expect(missingCursorResponse.status).toBe(409);
+    expect(JSON.stringify(await missingCursorResponse.json())).toContain("EVENT_CURSOR_EXPIRED");
+
     const heartbeatResponse = await fetch(`${endpoint}/events`, {
       headers: {
         Accept: "text/event-stream",
         Authorization: `Bearer ${credential.token}`,
+        "Last-Event-ID": retained.at(-1)?.eventId ?? "0",
       },
       redirect: "error",
     });

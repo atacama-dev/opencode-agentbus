@@ -159,14 +159,16 @@ describe("broker registry and persistence", () => {
     }
   });
 
-  test("enforces active-session limits", () => {
+  test("defers background registrations instead of bypassing active-session limits", () => {
     const harness = createHarness({ limits: { maxActiveSessionsPerPrincipal: 1 } });
     try {
       expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("one")));
-      expectError(
-        harness.service.dispatch(harness.service.principal, registerRequest("two")),
-        "RATE_LIMITED",
-      );
+      expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("two")));
+      expect(harness.service.storageStatsForTesting()).toMatchObject({
+        sessions: 2,
+        activeSessions: 1,
+        displacedSessions: 1,
+      });
     } finally {
       harness.close();
     }
@@ -188,10 +190,11 @@ describe("broker registry and persistence", () => {
         harness.service.dispatch(harness.service.principal, registerRequest("second")),
       );
 
-      expectError(
-        harness.service.dispatch(harness.service.principal, registerRequest("first")),
-        "RATE_LIMITED",
-      );
+      expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("first")));
+      expect(harness.service.storageStatsForTesting()).toMatchObject({
+        activeSessions: 1,
+        displacedSessions: 1,
+      });
       expect(second.registration).toBe("created");
     } finally {
       harness.close();
@@ -207,13 +210,16 @@ describe("broker registry and persistence", () => {
       harness.clock.advance(121_000);
       expectSuccess(harness.service.dispatch(harness.service.principal, registerRequest("active")));
 
-      expectError(
+      expectSuccess(
         harness.service.dispatch(
           harness.service.principal,
           claimRequest(METHODS.HEARTBEAT_SESSION, expired.identity),
         ),
-        "RATE_LIMITED",
       );
+      expect(harness.service.storageStatsForTesting()).toMatchObject({
+        activeSessions: 1,
+        displacedSessions: 1,
+      });
     } finally {
       harness.close();
     }

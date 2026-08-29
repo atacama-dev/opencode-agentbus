@@ -222,6 +222,37 @@ describe("public authentication challenge", () => {
     expect(before.token).not.toBe(replacement.token);
   });
 
+  test("same-port restart closes stale keep-alive challenge connections", async () => {
+    harness = createHarness();
+    daemon = new BrokerDaemon({
+      service: harness.service,
+      hostname: "127.0.0.1",
+      port: 0,
+      clock: harness.clock,
+    });
+    const endpoint = await daemon.start();
+    const port = Number(new URL(endpoint).port);
+    const first = await requestChallenge(endpoint, nonce(0xa6));
+    expect(first.status).toBe(200);
+    AuthChallengeResponseSchema.parse(await first.json());
+
+    await daemon.stop();
+    daemon = undefined;
+    harness.close();
+    harness = createHarness();
+    daemon = new BrokerDaemon({
+      service: harness.service,
+      hostname: "127.0.0.1",
+      port,
+      clock: harness.clock,
+    });
+    expect(await daemon.start()).toBe(endpoint);
+
+    const afterRestart = await requestChallenge(endpoint, nonce(0xa7));
+    expect(afterRestart.status).toBe(200);
+    await afterRestart.body?.cancel();
+  });
+
   test("bounds challenge attempts and recovers after the retry window", async () => {
     harness = createHarness();
     daemon = new BrokerDaemon({

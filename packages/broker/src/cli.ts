@@ -2,6 +2,8 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { BROKER_CLI_EXIT_CODES } from "@opencode-agentbus/protocol";
+import { BrokerLeaseContentionError, acquireBrokerProcessLease } from "./process-lease";
 import { BrokerDaemon, BROKER_DEFAULTS, validateListenHost } from "./server";
 import { BrokerService, type BrokerLogger } from "./service";
 
@@ -88,7 +90,15 @@ export async function launchBrokerDaemon(
 }
 
 async function main(): Promise<void> {
-  const daemon = await launchBrokerDaemon(parseBrokerEnvironment(process.env));
+  const config = parseBrokerEnvironment(process.env);
+  const lease = await acquireBrokerProcessLease({ hostname: config.hostname, port: config.port });
+  let daemon: BrokerDaemon;
+  try {
+    daemon = await launchBrokerDaemon(config);
+  } catch (error) {
+    await lease.release();
+    throw error;
+  }
   daemonLogger.info("Agent bus broker started on the configured loopback endpoint.");
   let stopping = false;
   const shutdown = () => {
@@ -96,10 +106,14 @@ async function main(): Promise<void> {
     stopping = true;
     daemon
       .stop()
-      .then(() => process.exit(0))
-      .catch(() => {
+      .then(async () => {
+        await lease.release();
+        process.exit(BROKER_CLI_EXIT_CODES.SUCCESS);
+      })
+      .catch(async () => {
+        await lease.release();
         daemonLogger.error("Agent bus broker shutdown failed.");
-        process.exit(1);
+        process.exit(BROKER_CLI_EXIT_CODES.FAILURE);
       });
   };
   process.once("SIGINT", shutdown);
@@ -107,8 +121,11 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch(() => {
+  main().catch((error) => {
+    if (error instanceof BrokerLeaseContentionError) {
+      process.exit(BROKER_CLI_EXIT_CODES.LEASE_CONTENTION);
+    }
     daemonLogger.error("Agent bus broker startup failed.");
-    process.exit(1);
+    process.exit(BROKER_CLI_EXIT_CODES.FAILURE);
   });
 }

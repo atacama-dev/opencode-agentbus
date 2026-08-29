@@ -135,6 +135,20 @@ export function enqueueRequest(
   } as const;
 }
 
+export function replyRequest(
+  source: SessionIdentity,
+  messageId: string,
+  body: string,
+  ttlSeconds = 60,
+) {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    requestId: requestId("reply"),
+    method: METHODS.REPLY_MESSAGE,
+    params: { source, messageId, body, ttlSeconds },
+  } as const;
+}
+
 export function expectedMessageRequest(
   method: typeof METHODS.CONSUME_MESSAGE | typeof METHODS.REJECT_MESSAGE,
   messageId: string,

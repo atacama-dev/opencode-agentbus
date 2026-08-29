@@ -117,6 +117,10 @@ describe("canonical registry metadata index", () => {
       );
       harness.service.close();
       const database = new Database(harness.databasePath);
+      database.run("DROP INDEX IF EXISTS sessions_admission_idx");
+      database.run("ALTER TABLE sessions DROP COLUMN last_foreground_ms");
+      database.run("ALTER TABLE sessions DROP COLUMN displaced");
+      database.run("ALTER TABLE messages DROP COLUMN reply_to_message_id");
       database.run("UPDATE sessions SET metadata_search = metadata_json");
       database.run("PRAGMA user_version = 2");
       database.close();
@@ -129,7 +133,7 @@ describe("canonical registry metadata index", () => {
         random: harness.random,
       });
       try {
-        expect(migrated.schemaVersionForTesting()).toBe(3);
+        expect(migrated.schemaVersionForTesting()).toBe(5);
         const result = expectSuccess<SearchSessionsResult>(
           migrated.dispatch(migrated.principal, searchRequest(requester, "café build agent")),
         );

@@ -7,6 +7,7 @@ import {
   DEFAULT_SESSION_LEASE_SECONDS,
   DeregisterSessionRequestSchema,
   EnqueueMessageRequestSchema,
+  ForegroundIdentityRequestSchema,
   HandshakeRequestSchema,
   HeartbeatSessionRequestSchema,
   ListPendingMessagesRequestSchema,
@@ -23,6 +24,7 @@ import {
   PrincipalIdSchema,
   RegisterSessionRequestSchema,
   RejectMessageRequestSchema,
+  ReplyMessageRequestSchema,
   RequestIdSchema,
   SearchSessionsRequestSchema,
   ServerIdSchema,
@@ -40,6 +42,7 @@ import {
   type CredentialFile,
   type ErrorCode,
   type ErrorEnvelope,
+  type EventCursor,
   type Method,
   type PendingMessageEvent,
 } from "@opencode-agentbus/protocol";
@@ -85,6 +88,7 @@ export interface BrokerServiceOptions {
 
 export interface EventReplaySuccess {
   readonly ok: true;
+  readonly cursor: EventCursor;
   readonly events: readonly PendingMessageEvent[];
 }
 
@@ -111,9 +115,11 @@ const methodValues = new Set<string>(Object.values(METHODS));
 const requestSchemas: Readonly<Record<Method, z.ZodTypeAny>> = {
   [METHODS.HANDSHAKE]: HandshakeRequestSchema,
   [METHODS.REGISTER_SESSION]: RegisterSessionRequestSchema,
+  [METHODS.RESOLVE_FOREGROUND_SESSION]: ForegroundIdentityRequestSchema,
   [METHODS.HEARTBEAT_SESSION]: HeartbeatSessionRequestSchema,
   [METHODS.DEREGISTER_SESSION]: DeregisterSessionRequestSchema,
   [METHODS.ENQUEUE_MESSAGE]: EnqueueMessageRequestSchema,
+  [METHODS.REPLY_MESSAGE]: ReplyMessageRequestSchema,
   [METHODS.PEEK_NEXT_MESSAGE]: PeekNextMessageRequestSchema,
   [METHODS.LIST_PENDING_MESSAGES]: ListPendingMessagesRequestSchema,
   [METHODS.CONSUME_MESSAGE]: ConsumeMessageRequestSchema,
@@ -130,6 +136,15 @@ function validatedLimits(overrides: Partial<BrokerLimits> | undefined): BrokerLi
       Math.min(
         DEFAULT_STORE_LIMITS.maxActiveSessionsPerPrincipal,
         overrides?.maxSessionsPerPrincipal ?? DEFAULT_STORE_LIMITS.maxSessionsPerPrincipal,
+      ),
+    foregroundSessionReserve:
+      overrides?.foregroundSessionReserve ??
+      Math.min(
+        DEFAULT_STORE_LIMITS.foregroundSessionReserve,
+        Math.max(
+          1,
+          (overrides?.maxSessionsPerPrincipal ?? DEFAULT_STORE_LIMITS.maxSessionsPerPrincipal) - 1,
+        ),
       ),
     maxPendingPerPrincipal:
       overrides?.maxPendingPerPrincipal ??
@@ -151,6 +166,7 @@ function validatedLimits(overrides: Partial<BrokerLimits> | undefined): BrokerLi
     "maxActiveSessionsPerPrincipal",
     "maxSessionsPerPrincipal",
     "maxSessionsGlobal",
+    "foregroundSessionReserve",
     "registrationsPerPrincipalPerMinute",
     "enqueuePerPrincipalPerMinute",
     "enqueuePerSessionPerMinute",
@@ -177,6 +193,7 @@ function validatedLimits(overrides: Partial<BrokerLimits> | undefined): BrokerLi
   }
   if (
     limits.maxActiveSessionsPerPrincipal > limits.maxSessionsPerPrincipal ||
+    limits.foregroundSessionReserve >= limits.maxSessionsPerPrincipal ||
     limits.maxSessionsPerPrincipal > limits.maxSessionsGlobal ||
     limits.maxPendingPerPrincipal > limits.maxMessagesPerPrincipal ||
     limits.maxMessagesPerSourceSession > limits.maxMessagesPerPrincipal ||
@@ -230,6 +247,20 @@ function genericSuccess(requestId: string, result: unknown): ApplicationResponse
     requestId,
     ok: true,
     result,
+  });
+}
+
+function foregroundSuccess(
+  requestId: string,
+  result: unknown,
+  foregroundRecovery: unknown,
+): ApplicationResponseEnvelope {
+  return ApplicationResponseEnvelopeSchema.parse({
+    protocolVersion: PROTOCOL_VERSION,
+    requestId,
+    ok: true,
+    result,
+    foregroundRecovery,
   });
 }
 
@@ -359,12 +390,12 @@ export class BrokerService {
     if (!principalsEqual(principal, this.principal) || !this.store.hasPrincipal(principal)) {
       return { ok: false, error: createErrorEnvelope(correlationId, "FORBIDDEN") };
     }
-    if (cursor !== undefined && !/^[1-9][0-9]{0,19}$/.test(cursor)) {
+    if (cursor !== undefined && !/^(0|[1-9][0-9]{0,19})$/.test(cursor)) {
       return { ok: false, error: createErrorEnvelope(correlationId, "EVENT_CURSOR_EXPIRED") };
     }
     try {
       this.store.maintenance();
-      return { ok: true, events: this.store.replayEvents(principal, cursor) };
+      return { ok: true, ...this.store.replayEvents(principal, cursor) };
     } catch (error) {
       if (error instanceof BrokerOperationError) {
         return { ok: false, error: createErrorEnvelope(correlationId, error.code, error.details) };
@@ -421,7 +452,12 @@ export class BrokerService {
     candidate: Record<string, unknown>,
   ): ErrorCode | undefined {
     if (candidate.protocolVersion !== PROTOCOL_VERSION) return "INVALID_REQUEST";
-    if (method !== METHODS.ENQUEUE_MESSAGE || !isRecord(candidate.params)) return undefined;
+    if (
+      (method !== METHODS.ENQUEUE_MESSAGE && method !== METHODS.REPLY_MESSAGE) ||
+      !isRecord(candidate.params)
+    ) {
+      return undefined;
+    }
     const body = candidate.params.body;
     if (typeof body === "string") {
       if (!isWellFormedUnicode(body)) return "INVALID_REQUEST";
@@ -452,6 +488,11 @@ export class BrokerService {
           request.requestId,
           this.store.register(principal, request.params.hostSessionId, request.params.metadata),
         );
+      case METHODS.RESOLVE_FOREGROUND_SESSION:
+        return genericSuccess(
+          request.requestId,
+          this.store.resolveForegroundIdentity(principal, request.params),
+        );
       case METHODS.HEARTBEAT_SESSION:
         return genericSuccess(
           request.requestId,
@@ -470,26 +511,42 @@ export class BrokerService {
           request.params.body,
           request.params.ttlSeconds,
           request.requestId,
+          request.params.foreground,
         );
-        for (const listener of this.listeners) {
-          try {
-            listener(stored.event);
-          } catch {
-            this.logger.warn("Broker event subscriber failed.");
-          }
-        }
-        return genericSuccess(request.requestId, stored.receipt);
+        this.publishPendingEvent(stored.event);
+        return stored.foregroundRecovery
+          ? foregroundSuccess(request.requestId, stored.receipt, stored.foregroundRecovery)
+          : genericSuccess(request.requestId, stored.receipt);
+      }
+      case METHODS.REPLY_MESSAGE: {
+        const stored = this.store.reply(
+          principal,
+          request.params.source,
+          request.params.messageId,
+          request.params.body,
+          request.params.ttlSeconds,
+          request.requestId,
+          request.params.foreground,
+        );
+        this.publishPendingEvent(stored.event);
+        return stored.foregroundRecovery
+          ? foregroundSuccess(request.requestId, stored.receipt, stored.foregroundRecovery)
+          : genericSuccess(request.requestId, stored.receipt);
       }
       case METHODS.PEEK_NEXT_MESSAGE:
         return genericSuccess(request.requestId, {
-          header: this.store.peek(principal, request.params.target),
+          header: this.store.peek(principal, request.params.target, request.params.foreground),
         });
       case METHODS.LIST_PENDING_MESSAGES:
-        return genericSuccess(request.requestId, {
-          target: request.params.target,
-          requestedLimit: request.params.limit,
-          headers: this.store.listPending(principal, request.params.target, request.params.limit),
-        });
+        return genericSuccess(
+          request.requestId,
+          this.store.listPending(
+            principal,
+            request.params.target,
+            request.params.limit,
+            request.params.foreground,
+          ),
+        );
       case METHODS.CONSUME_MESSAGE:
         return genericSuccess(
           request.requestId,
@@ -498,6 +555,7 @@ export class BrokerService {
             request.params.target,
             request.params.messageId,
             request.params.expectedBodyHash,
+            request.params.foreground,
           ),
         );
       case METHODS.REJECT_MESSAGE:
@@ -508,18 +566,31 @@ export class BrokerService {
             request.params.target,
             request.params.messageId,
             request.params.expectedBodyHash,
+            request.params.foreground,
           ),
         );
-      case METHODS.SEARCH_SESSIONS:
-        return genericSuccess(
-          request.requestId,
-          this.store.search(
-            principal,
-            request.params.requester,
-            request.params.query,
-            request.params.limit,
-          ),
+      case METHODS.SEARCH_SESSIONS: {
+        const stored = this.store.search(
+          principal,
+          request.params.requester,
+          request.params.query,
+          request.params.limit,
+          request.params.foreground,
         );
+        return stored.foregroundRecovery
+          ? foregroundSuccess(request.requestId, stored.result, stored.foregroundRecovery)
+          : genericSuccess(request.requestId, stored.result);
+      }
+    }
+  }
+
+  private publishPendingEvent(event: PendingMessageEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        this.logger.warn("Broker event subscriber failed.");
+      }
     }
   }
 

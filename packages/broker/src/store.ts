@@ -3,12 +3,17 @@ import { Database, type SQLQueryBindings } from "bun:sqlite";
 import {
   BrokerIdSchema,
   ConsumedMessageResultSchema,
+  DEFAULT_PENDING_LIST_LIMIT,
   EnqueueMessageReceiptSchema,
+  EventCursorSchema,
   MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   PendingMessageEventSchema,
+  PROTOCOL_VERSION,
   RegistrationResultSchema,
+  ForegroundIdentityResultSchema,
   RegistrySearchMatchSchema,
   RejectMessageResultSchema,
+  ReplyMessageReceiptSchema,
   SessionMetadataSchema,
   SessionHeartbeatResultSchema,
   bodySha256,
@@ -20,10 +25,15 @@ import {
   type DeregisterSessionResult,
   type EnqueueMessageReceipt,
   type ErrorCode,
+  type EventCursor,
+  type ForegroundSession,
+  type ForegroundIdentityResult,
+  type ForegroundPendingRecovery,
   type PendingMessageEvent,
   type PendingMessageHeader,
   type RegistrationResult,
   type RejectMessageResult,
+  type ReplyMessageReceipt,
   type SafeErrorDetails,
   type SearchSessionsResult,
   type SessionHeartbeatResult,
@@ -48,6 +58,7 @@ export interface StoreLimits {
   readonly maxActiveSessionsPerPrincipal: number;
   readonly maxSessionsPerPrincipal: number;
   readonly maxSessionsGlobal: number;
+  readonly foregroundSessionReserve: number;
   readonly registrationsPerPrincipalPerMinute: number;
   readonly enqueuePerPrincipalPerMinute: number;
   readonly enqueuePerSessionPerMinute: number;
@@ -75,6 +86,8 @@ export interface MaintenanceResult {
 
 export interface StorageStats {
   readonly sessions: number;
+  readonly activeSessions: number;
+  readonly displacedSessions: number;
   readonly messages: number;
   readonly events: number;
   readonly enqueueRateRows: number;
@@ -102,10 +115,15 @@ interface SessionRow {
   metadata_search: string;
   opt_in: number;
   lease_expires_ms: number;
+  displaced: number;
+  last_foreground_ms: number | null;
+  created_ms: number;
+  updated_ms: number;
 }
 
 interface MessageHeaderRow {
   message_id: string;
+  reply_to_message_id: string | null;
   source_session_id: string;
   target_session_id: string;
   body_hash: string;
@@ -126,6 +144,13 @@ interface RejectableMessageRow {
   state: "PENDING" | "DELIVERED" | "REJECTED" | "EXPIRED";
   expires_ms: number;
   rejected_ms: number | null;
+}
+
+interface ReplyOriginalRow {
+  message_id: string;
+  source_session_id: string;
+  target_session_id: string;
+  state: "PENDING" | "DELIVERED" | "REJECTED" | "EXPIRED";
 }
 
 interface CountRow {
@@ -161,8 +186,48 @@ interface EventRow {
   event_json: string;
 }
 
+export interface EventReplaySnapshot {
+  readonly cursor: EventCursor;
+  readonly events: readonly PendingMessageEvent[];
+}
+
 interface UserVersionRow {
   user_version: number;
+}
+
+interface TableInfoRow {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+}
+
+interface ForeignKeyInfoRow {
+  id: number;
+  seq: number;
+  table: string;
+  from: string;
+  to: string;
+  on_update: string;
+  on_delete: string;
+  match: string;
+}
+
+interface IndexListRow {
+  name: string;
+  unique: number;
+  origin: string;
+  partial: number;
+}
+
+interface IndexInfoRow {
+  seqno: number;
+  name: string;
+}
+
+interface SchemaSqlRow {
+  sql: string | null;
 }
 
 interface MutationFailure {
@@ -181,7 +246,7 @@ type BrokerDatabase = Omit<Database, "run"> & {
   run(sql: string, ...bindings: SQLQueryBindings[]): { changes: number | bigint };
 };
 
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 5;
 
 function iso(milliseconds: number): string {
   return new Date(milliseconds).toISOString();
@@ -280,10 +345,13 @@ export class BrokerStore {
         if (version === 1) this.applyMigration1();
         else if (version === 2) this.applyMigration2();
         else if (version === 3) this.applyMigration3();
+        else if (version === 4) this.applyMigration4();
+        else if (version === 5) this.applyMigration5();
         else throw new Error("Broker database migration is unavailable.");
         this.database.run(`PRAGMA user_version = ${version}`);
       });
     }
+    this.assertCanonicalSessionsSchema(CURRENT_SCHEMA_VERSION);
   }
 
   private applyMigration1(): void {
@@ -416,6 +484,171 @@ export class BrokerStore {
     }
   }
 
+  private applyMigration4(): void {
+    const existingColumns = this.database
+      .query<TableInfoRow, []>("PRAGMA table_info(messages)")
+      .all();
+    if (existingColumns.some((column) => column.name === "reply_to_message_id")) {
+      throw new Error("Broker reply_to_message_id column is a noncanonical partial migration.");
+    }
+    this.database.run("ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT");
+    const columns = this.database.query<TableInfoRow, []>("PRAGMA table_info(messages)").all();
+    const replyColumn = columns.find((column) => column.name === "reply_to_message_id");
+    if (
+      !replyColumn ||
+      replyColumn.type.trim().toUpperCase() !== "TEXT" ||
+      replyColumn.notnull !== 0 ||
+      replyColumn.dflt_value !== null ||
+      replyColumn.pk !== 0
+    ) {
+      throw new Error("Broker reply_to_message_id column is incompatible.");
+    }
+    const foreignKeys = this.database
+      .query<ForeignKeyInfoRow, []>("PRAGMA foreign_key_list(messages)")
+      .all();
+    if (foreignKeys.some((foreignKey) => foreignKey.from === "reply_to_message_id")) {
+      throw new Error("Broker reply_to_message_id foreign key is incompatible.");
+    }
+  }
+
+  private applyMigration5(): void {
+    this.assertCanonicalSessionsSchema(4);
+    this.database.run(
+      "ALTER TABLE sessions ADD COLUMN displaced INTEGER NOT NULL DEFAULT 0 CHECK (displaced IN (0, 1))",
+    );
+    this.database.run("ALTER TABLE sessions ADD COLUMN last_foreground_ms INTEGER");
+    this.database.run(
+      `CREATE INDEX sessions_admission_idx
+       ON sessions(principal_id, opt_in, lease_expires_ms, last_foreground_ms, created_ms, session_id)`,
+    );
+    this.assertCanonicalSessionsSchema(5);
+  }
+
+  private assertCanonicalSessionsSchema(version: 4 | 5): void {
+    const expectedColumns: readonly TableInfoRow[] = [
+      { name: "principal_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 1 },
+      { name: "host_session_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 2 },
+      { name: "session_id", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "metadata_json", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "metadata_search", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "opt_in", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "lease_expires_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "created_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { name: "updated_ms", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      ...(version === 5
+        ? [
+            {
+              name: "displaced",
+              type: "INTEGER",
+              notnull: 1,
+              dflt_value: "0",
+              pk: 0,
+            },
+            {
+              name: "last_foreground_ms",
+              type: "INTEGER",
+              notnull: 0,
+              dflt_value: null,
+              pk: 0,
+            },
+          ]
+        : []),
+    ];
+    const columns = this.database.query<TableInfoRow, []>("PRAGMA table_info(sessions)").all();
+    const normalizedColumns = columns.map((column) => ({
+      name: column.name,
+      type: column.type.trim().toUpperCase(),
+      notnull: column.notnull,
+      dflt_value: column.dflt_value,
+      pk: column.pk,
+    }));
+    if (JSON.stringify(normalizedColumns) !== JSON.stringify(expectedColumns)) {
+      throw new Error(`Broker sessions schema v${version} columns are noncanonical.`);
+    }
+
+    const tableSql = this.database
+      .query<SchemaSqlRow, [string]>(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+      )
+      .get("sessions")?.sql;
+    if (
+      !tableSql ||
+      !/CHECK\s*\(\s*opt_in\s+IN\s*\(\s*0\s*,\s*1\s*\)\s*\)/i.test(tableSql) ||
+      (version === 5 &&
+        !/CHECK\s*\(\s*displaced\s+IN\s*\(\s*0\s*,\s*1\s*\)\s*\)/i.test(tableSql)) ||
+      (tableSql.match(/\bCHECK\s*\(/gi)?.length ?? 0) !== (version === 5 ? 2 : 1)
+    ) {
+      throw new Error(`Broker sessions schema v${version} checks are noncanonical.`);
+    }
+
+    const foreignKeys = this.database
+      .query<ForeignKeyInfoRow, []>("PRAGMA foreign_key_list(sessions)")
+      .all();
+    if (
+      foreignKeys.length !== 1 ||
+      foreignKeys[0]?.table !== "principals" ||
+      foreignKeys[0]?.from !== "principal_id" ||
+      foreignKeys[0]?.to !== "principal_id" ||
+      foreignKeys[0]?.on_update.toUpperCase() !== "NO ACTION" ||
+      foreignKeys[0]?.on_delete.toUpperCase() !== "NO ACTION" ||
+      foreignKeys[0]?.match.toUpperCase() !== "NONE"
+    ) {
+      throw new Error(`Broker sessions schema v${version} foreign key is noncanonical.`);
+    }
+
+    const indexes = this.database.query<IndexListRow, []>("PRAGMA index_list(sessions)").all();
+    const indexColumns = (name: string): readonly string[] =>
+      this.database
+        .query<IndexInfoRow, []>(`PRAGMA index_info(${JSON.stringify(name)})`)
+        .all()
+        .sort((left, right) => left.seqno - right.seqno)
+        .map((column) => column.name);
+    const uniqueConstraints = indexes
+      .filter((index) => index.unique === 1)
+      .map((index) => ({ origin: index.origin, columns: indexColumns(index.name) }))
+      .sort((left, right) => left.origin.localeCompare(right.origin));
+    const expectedUniqueConstraints = [
+      { origin: "pk", columns: ["principal_id", "host_session_id"] },
+      { origin: "u", columns: ["session_id"] },
+    ].sort((left, right) => left.origin.localeCompare(right.origin));
+    if (JSON.stringify(uniqueConstraints) !== JSON.stringify(expectedUniqueConstraints)) {
+      throw new Error(`Broker sessions schema v${version} uniqueness is noncanonical.`);
+    }
+
+    const expectedIndexes = new Map<string, readonly string[]>([
+      ["sessions_active_idx", ["principal_id", "opt_in", "lease_expires_ms"]],
+      ["sessions_retention_idx", ["opt_in", "lease_expires_ms", "updated_ms"]],
+      ...(version === 5
+        ? [
+            [
+              "sessions_admission_idx",
+              [
+                "principal_id",
+                "opt_in",
+                "lease_expires_ms",
+                "last_foreground_ms",
+                "created_ms",
+                "session_id",
+              ],
+            ] as const,
+          ]
+        : []),
+    ]);
+    const explicitIndexes = indexes.filter((index) => index.origin === "c");
+    if (
+      explicitIndexes.length !== expectedIndexes.size ||
+      explicitIndexes.some(
+        (index) =>
+          index.unique !== 0 ||
+          index.partial !== 0 ||
+          JSON.stringify(indexColumns(index.name)) !==
+            JSON.stringify(expectedIndexes.get(index.name)),
+      )
+    ) {
+      throw new Error(`Broker sessions schema v${version} indexes are noncanonical.`);
+    }
+  }
+
   schemaVersion(): number {
     const row = this.database.query<UserVersionRow, []>("PRAGMA user_version").get();
     if (!row || !Number.isInteger(row.user_version) || row.user_version < 0) {
@@ -470,7 +703,7 @@ export class BrokerStore {
       const existing = this.database
         .query<SessionRow, [string, string]>(
           `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
-                  opt_in, lease_expires_ms
+                  opt_in, lease_expires_ms, displaced, last_foreground_ms, created_ms, updated_ms
            FROM sessions WHERE principal_id = ? AND host_session_id = ?`,
         )
         .get(principal.principalId, hostSessionId);
@@ -478,9 +711,6 @@ export class BrokerStore {
       const existingMetadataJson = existing
         ? canonicalMetadataJson(SessionMetadataSchema.parse(JSON.parse(existing.metadata_json)))
         : undefined;
-      const isChargedChange =
-        !existing || existing.opt_in !== 1 || existingMetadataJson !== metadataJson;
-      if (isChargedChange) this.enforceRegistrationRate(principal, now);
       if (!existing) {
         const principalSessions = this.database
           .query<CountRow, [string]>(
@@ -491,44 +721,50 @@ export class BrokerStore {
           .query<CountRow, []>("SELECT COUNT(*) AS count FROM sessions")
           .get()?.count;
         if (
-          (principalSessions ?? 0) >= this.limits.maxSessionsPerPrincipal ||
+          (principalSessions ?? 0) >=
+            this.limits.maxSessionsPerPrincipal - this.limits.foregroundSessionReserve ||
           (globalSessions ?? 0) >= this.limits.maxSessionsGlobal
         ) {
           throw new BrokerOperationError("RATE_LIMITED", { retryAfterMs: 100 });
         }
       }
-      if (!existing || existing.opt_in !== 1 || existing.lease_expires_ms <= now) {
-        const active = this.database
-          .query<CountRow, [string, number]>(
-            `SELECT COUNT(*) AS count FROM sessions
-             WHERE principal_id = ? AND opt_in = 1 AND lease_expires_ms > ?`,
-          )
-          .get(principal.principalId, now)?.count;
-        if ((active ?? 0) >= this.limits.maxActiveSessionsPerPrincipal) {
-          throw new BrokerOperationError("RATE_LIMITED", { retryAfterMs: 100 });
-        }
-      }
+
+      const alreadyActive =
+        existing !== null &&
+        existing !== undefined &&
+        existing.opt_in === 1 &&
+        existing.lease_expires_ms > now;
+      const active = this.activeSessionCount(principal.principalId, now);
+      const deferred =
+        existing?.displaced === 1 ||
+        (!alreadyActive && active >= this.limits.maxActiveSessionsPerPrincipal);
+      const isChargedChange =
+        !deferred && (!existing || existing.opt_in !== 1 || existingMetadataJson !== metadataJson);
+      if (isChargedChange) this.enforceRegistrationRate(principal, now);
 
       const sessionId = existing?.session_id ?? this.canonicalSessionId(principal, hostSessionId);
       this.database.run(
         `INSERT INTO sessions(
            principal_id, host_session_id, session_id, metadata_json, metadata_search,
-           opt_in, lease_expires_ms, created_ms, updated_ms
-         ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+           opt_in, lease_expires_ms, created_ms, updated_ms, displaced, last_foreground_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(principal_id, host_session_id) DO UPDATE SET
-           metadata_json = excluded.metadata_json,
-           metadata_search = excluded.metadata_search,
-           opt_in = 1,
-           lease_expires_ms = excluded.lease_expires_ms,
-           updated_ms = excluded.updated_ms`,
+            metadata_json = excluded.metadata_json,
+            metadata_search = excluded.metadata_search,
+            opt_in = excluded.opt_in,
+            lease_expires_ms = excluded.lease_expires_ms,
+            displaced = excluded.displaced,
+            updated_ms = excluded.updated_ms`,
         principal.principalId,
         hostSessionId,
         sessionId,
         metadataJson,
         metadataSearchText(metadata),
+        deferred ? 0 : 1,
         leaseExpires,
         now,
         now,
+        deferred ? 1 : 0,
       );
       if (isChargedChange) {
         this.database.run(
@@ -543,10 +779,25 @@ export class BrokerStore {
         identity,
         fingerprint: sessionFingerprint(identity),
         metadata,
-        registration: existing ? "refreshed" : "created",
+        registration: deferred ? "deferred" : existing ? "refreshed" : "created",
         leaseSeconds: this.limits.sessionLeaseSeconds,
         leaseExpiresAt: iso(leaseExpires),
       });
+    });
+  }
+
+  resolveForegroundIdentity(
+    principal: AuthenticatedClientPrincipal,
+    foreground: ForegroundSession,
+  ): ForegroundIdentityResult {
+    const sessionId = this.canonicalSessionId(principal, foreground.hostSessionId);
+    const identity = this.identity(principal.serverId, sessionId);
+    return ForegroundIdentityResultSchema.parse({
+      hostSessionId: foreground.hostSessionId,
+      identity,
+      fingerprint: sessionFingerprint(identity),
+      metadata: foreground.metadata,
+      leaseSeconds: this.limits.sessionLeaseSeconds,
     });
   }
 
@@ -558,20 +809,35 @@ export class BrokerStore {
     const leaseExpires = now + this.limits.sessionLeaseSeconds * 1_000;
     return this.transaction(() => {
       const session = this.requireOwnedSession(principal, claim, false, "SESSION_NOT_REGISTERED");
+      if (session.displaced === 1) {
+        return SessionHeartbeatResultSchema.parse({
+          identity: claim,
+          leaseSeconds: this.limits.sessionLeaseSeconds,
+          leaseExpiresAt: iso(leaseExpires),
+        });
+      }
       if (session.opt_in !== 1) throw new BrokerOperationError("SESSION_NOT_REGISTERED");
       if (session.lease_expires_ms <= now) {
-        const active = this.database
-          .query<CountRow, [string, number]>(
-            `SELECT COUNT(*) AS count FROM sessions
-             WHERE principal_id = ? AND opt_in = 1 AND lease_expires_ms > ?`,
-          )
-          .get(principal.principalId, now)?.count;
-        if ((active ?? 0) >= this.limits.maxActiveSessionsPerPrincipal) {
-          throw new BrokerOperationError("RATE_LIMITED", { retryAfterMs: 100 });
+        if (
+          this.activeSessionCount(principal.principalId, now) >=
+          this.limits.maxActiveSessionsPerPrincipal
+        ) {
+          this.database.run(
+            `UPDATE sessions SET opt_in = 0, displaced = 1, updated_ms = ?
+             WHERE principal_id = ? AND session_id = ?`,
+            now,
+            principal.principalId,
+            session.session_id,
+          );
+          return SessionHeartbeatResultSchema.parse({
+            identity: claim,
+            leaseSeconds: this.limits.sessionLeaseSeconds,
+            leaseExpiresAt: iso(leaseExpires),
+          });
         }
       }
       this.database.run(
-        `UPDATE sessions SET opt_in = 1, lease_expires_ms = ?, updated_ms = ?
+        `UPDATE sessions SET opt_in = 1, displaced = 0, lease_expires_ms = ?, updated_ms = ?
          WHERE principal_id = ? AND session_id = ?`,
         leaseExpires,
         now,
@@ -603,7 +869,8 @@ export class BrokerStore {
       const disposition = row?.opt_in === 1 ? "deregistered" : "already_absent";
       if (row) {
         this.database.run(
-          "UPDATE sessions SET opt_in = 0, updated_ms = ? WHERE principal_id = ? AND session_id = ?",
+          `UPDATE sessions SET opt_in = 0, displaced = 0, updated_ms = ?
+           WHERE principal_id = ? AND session_id = ?`,
           this.clock.now(),
           principal.principalId,
           claim.sessionId,
@@ -620,74 +887,125 @@ export class BrokerStore {
     body: string,
     ttlSeconds: number,
     correlationId: string,
-  ): { receipt: EnqueueMessageReceipt; event: PendingMessageEvent } {
+    foreground?: ForegroundSession,
+  ): {
+    receipt: EnqueueMessageReceipt;
+    event: PendingMessageEvent;
+    foregroundRecovery?: ForegroundPendingRecovery;
+  } {
     const now = this.clock.now();
-    const expires = now + ttlSeconds * 1_000;
-    const bodyHash = bodySha256(body);
-    const bodyBytes = Buffer.byteLength(body, "utf8");
-    const messageId = Buffer.from(this.random.bytes(32)).toString("hex");
     return this.transaction(() => {
-      const source = this.requireOwnedSession(
+      let source: SessionRow;
+      let target: SessionRow;
+      if (foreground) {
+        this.assertForegroundClaim(principal, foreground, sourceClaim);
+        const protectedSessionIds = new Set([sourceClaim.sessionId, targetClaim.sessionId]);
+        this.requireOwnedSession(principal, targetClaim, false, "TARGET_NOT_REGISTERED");
+        source = this.admitForegroundInTransaction(
+          principal,
+          foreground,
+          sourceClaim,
+          protectedSessionIds,
+          now,
+        ).row;
+        target = this.admitDisplacedDependency(
+          principal,
+          targetClaim,
+          protectedSessionIds,
+          now,
+          "TARGET_NOT_REGISTERED",
+        );
+      } else {
+        source = this.requireOwnedSession(principal, sourceClaim, true, "SESSION_NOT_REGISTERED");
+        target = this.requireOwnedSession(principal, targetClaim, true, "TARGET_NOT_REGISTERED");
+      }
+      const stored = this.enqueueResolved(
         principal,
-        sourceClaim,
-        true,
-        "SESSION_NOT_REGISTERED",
-      );
-      const target = this.requireOwnedSession(
-        principal,
-        targetClaim,
-        true,
-        "TARGET_NOT_REGISTERED",
-      );
-      this.enforceEnqueueRateLimits(principal, source.session_id, now);
-      this.enforceDurableMessageLimits(principal, source.session_id, now);
-      this.enforcePendingLimits(principal, target.session_id, now);
-
-      this.database.run(
-        `INSERT INTO messages(
-           message_id, source_session_id, target_session_id, target_principal_id,
-           body_hash, body_bytes, body, state, enqueued_ms, expires_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)`,
-        messageId,
-        source.session_id,
-        target.session_id,
-        principal.principalId,
-        bodyHash,
-        bodyBytes,
+        source,
+        target,
         body,
-        now,
-        expires,
-      );
-      this.database.run(
-        "INSERT INTO enqueue_rate(principal_id, source_session_id, occurred_ms) VALUES (?, ?, ?)",
-        principal.principalId,
-        source.session_id,
+        ttlSeconds,
+        correlationId,
         now,
       );
+      return foreground
+        ? {
+            ...stored,
+            foregroundRecovery: this.pendingRecovery(principal, source, now),
+          }
+        : stored;
+    });
+  }
 
-      const header = this.headerFromRow(
-        {
-          message_id: messageId,
-          source_session_id: source.session_id,
-          target_session_id: target.session_id,
-          body_hash: bodyHash,
-          body_bytes: bodyBytes,
-          state: "PENDING",
-          enqueued_ms: now,
-          expires_ms: expires,
-        },
-        principal.serverId,
+  reply(
+    principal: AuthenticatedClientPrincipal,
+    sourceClaim: SessionIdentity,
+    originalMessageId: string,
+    body: string,
+    ttlSeconds: number,
+    correlationId: string,
+    foreground?: ForegroundSession,
+  ): {
+    receipt: ReplyMessageReceipt;
+    event: PendingMessageEvent;
+    foregroundRecovery?: ForegroundPendingRecovery;
+  } {
+    const now = this.clock.now();
+    return this.transaction(() => {
+      if (foreground) this.assertForegroundClaim(principal, foreground, sourceClaim);
+      const sql = this.observe(`/* reply-message */
+        SELECT message_id, source_session_id, target_session_id, state
+        FROM messages WHERE message_id = ?`);
+      const original = this.database.query<ReplyOriginalRow, [string]>(sql).get(originalMessageId);
+      if (!original || original.target_session_id !== sourceClaim.sessionId) {
+        throw new BrokerOperationError("MESSAGE_NOT_FOUND");
+      }
+      if (original.state !== "DELIVERED") {
+        throw new BrokerOperationError("MESSAGE_NOT_REPLYABLE");
+      }
+      const targetClaim = this.identity(principal.serverId, original.source_session_id);
+      let source: SessionRow;
+      let target: SessionRow;
+      if (foreground) {
+        const protectedSessionIds = new Set([sourceClaim.sessionId, targetClaim.sessionId]);
+        this.requireOwnedSession(principal, targetClaim, false, "TARGET_NOT_REGISTERED");
+        source = this.admitForegroundInTransaction(
+          principal,
+          foreground,
+          sourceClaim,
+          protectedSessionIds,
+          now,
+        ).row;
+        target = this.admitDisplacedDependency(
+          principal,
+          targetClaim,
+          protectedSessionIds,
+          now,
+          "TARGET_NOT_REGISTERED",
+        );
+      } else {
+        source = this.requireOwnedSession(principal, sourceClaim, true, "SESSION_NOT_REGISTERED");
+        target = this.requireOwnedSession(principal, targetClaim, true, "TARGET_NOT_REGISTERED");
+      }
+      const stored = this.enqueueResolved(
+        principal,
+        source,
+        target,
+        body,
+        ttlSeconds,
+        correlationId,
+        now,
+        originalMessageId,
       );
-      const event = this.appendEvent(principal, target.session_id, correlationId, header, now);
       return {
-        receipt: EnqueueMessageReceiptSchema.parse({
-          messageId,
-          state: "PENDING",
-          bodyHash,
-          bodyBytes,
-          expiresAt: iso(expires),
+        receipt: ReplyMessageReceiptSchema.parse({
+          ...stored.receipt,
+          replyToMessageId: originalMessageId,
         }),
-        event,
+        event: stored.event,
+        ...(foreground === undefined
+          ? {}
+          : { foregroundRecovery: this.pendingRecovery(principal, source, now) }),
       };
     });
   }
@@ -695,19 +1013,23 @@ export class BrokerStore {
   peek(
     principal: AuthenticatedClientPrincipal,
     targetClaim: SessionIdentity,
+    foreground?: ForegroundSession,
   ): PendingMessageHeader | null {
     const now = this.clock.now();
     return this.transaction(() => {
-      const target = this.requireOwnedSession(
-        principal,
-        targetClaim,
-        true,
-        "TARGET_NOT_REGISTERED",
-      );
+      const target = foreground
+        ? this.admitForegroundInTransaction(
+            principal,
+            foreground,
+            targetClaim,
+            new Set([targetClaim.sessionId]),
+            now,
+          ).row
+        : this.requireOwnedSession(principal, targetClaim, true, "TARGET_NOT_REGISTERED");
       const row = this.database
         .query<MessageHeaderRow, [string, number]>(
-          `SELECT message_id, source_session_id, target_session_id, body_hash, body_bytes,
-                  state, enqueued_ms, expires_ms
+          `SELECT message_id, reply_to_message_id, source_session_id, target_session_id,
+                  body_hash, body_bytes, state, enqueued_ms, expires_ms
            FROM messages
            WHERE target_session_id = ? AND state = 'PENDING' AND expires_ms > ?
            ORDER BY enqueued_ms ASC, message_id ASC LIMIT 1`,
@@ -721,25 +1043,35 @@ export class BrokerStore {
     principal: AuthenticatedClientPrincipal,
     targetClaim: SessionIdentity,
     limit: number,
-  ): readonly PendingMessageHeader[] {
+    foreground?: ForegroundSession,
+  ): ForegroundPendingRecovery {
     const now = this.clock.now();
     return this.transaction(() => {
-      const target = this.requireOwnedSession(
-        principal,
-        targetClaim,
-        true,
-        "TARGET_NOT_REGISTERED",
-      );
-      return this.database
+      const target = foreground
+        ? this.admitForegroundInTransaction(
+            principal,
+            foreground,
+            targetClaim,
+            new Set([targetClaim.sessionId]),
+            now,
+          ).row
+        : this.requireRecoverableSession(principal, targetClaim, "TARGET_NOT_REGISTERED");
+      const headers = this.database
         .query<MessageHeaderRow, [string, number, number]>(
-          `SELECT message_id, source_session_id, target_session_id, body_hash, body_bytes,
-                  state, enqueued_ms, expires_ms
+          `SELECT message_id, reply_to_message_id, source_session_id, target_session_id,
+                  body_hash, body_bytes, state, enqueued_ms, expires_ms
            FROM messages
            WHERE target_session_id = ? AND state = 'PENDING' AND expires_ms > ?
            ORDER BY enqueued_ms ASC, message_id ASC LIMIT ?`,
         )
         .all(target.session_id, now, limit)
         .map((row) => this.headerFromRow(row, principal.serverId));
+      return {
+        target: this.identity(principal.serverId, target.session_id),
+        requestedLimit: limit,
+        eventCursor: this.currentEventCursor(principal),
+        headers,
+      };
     });
   }
 
@@ -748,6 +1080,7 @@ export class BrokerStore {
     targetClaim: SessionIdentity,
     messageId: string,
     expectedBodyHash: string,
+    foreground?: ForegroundSession,
   ):
     | {
         messageId: string;
@@ -762,10 +1095,20 @@ export class BrokerStore {
     | never {
     const now = this.clock.now();
     const outcome = this.transaction<MutationResult<ConsumedMessageResultLike>>(() => {
-      this.requireOwnedSession(principal, targetClaim, true, "TARGET_NOT_REGISTERED");
+      if (foreground) {
+        this.admitForegroundInTransaction(
+          principal,
+          foreground,
+          targetClaim,
+          new Set([targetClaim.sessionId]),
+          now,
+        );
+      } else {
+        this.requireOwnedSession(principal, targetClaim, true, "TARGET_NOT_REGISTERED");
+      }
       const sql = this.observe(`/* consume-message */
-        SELECT message_id, source_session_id, target_session_id, body_hash, body_bytes,
-               body, state, enqueued_ms, expires_ms
+        SELECT message_id, reply_to_message_id, source_session_id, target_session_id,
+               body_hash, body_bytes, body, state, enqueued_ms, expires_ms
         FROM messages WHERE message_id = ?`);
       const row = this.database.query<ConsumableMessageRow, [string]>(sql).get(messageId);
       if (!row || row.target_session_id !== targetClaim.sessionId) {
@@ -818,6 +1161,9 @@ export class BrokerStore {
         ok: true,
         value: {
           messageId: row.message_id,
+          ...(row.reply_to_message_id === null
+            ? {}
+            : { replyToMessageId: row.reply_to_message_id }),
           source: this.identity(principal.serverId, row.source_session_id),
           target: targetClaim,
           body: row.body,
@@ -837,10 +1183,21 @@ export class BrokerStore {
     targetClaim: SessionIdentity,
     messageId: string,
     expectedBodyHash: string,
+    foreground?: ForegroundSession,
   ): RejectMessageResult {
     const now = this.clock.now();
     const outcome = this.transaction<MutationResult<RejectMessageResult>>(() => {
-      this.requireOwnedSession(principal, targetClaim, true, "TARGET_NOT_REGISTERED");
+      if (foreground) {
+        this.admitForegroundInTransaction(
+          principal,
+          foreground,
+          targetClaim,
+          new Set([targetClaim.sessionId]),
+          now,
+        );
+      } else {
+        this.requireOwnedSession(principal, targetClaim, true, "TARGET_NOT_REGISTERED");
+      }
       const sql = this.observe(`/* reject-message */
         SELECT message_id, target_session_id, body_hash, state, expires_ms, rejected_ms
         FROM messages WHERE message_id = ?`);
@@ -918,21 +1275,39 @@ export class BrokerStore {
     requester: SessionIdentity,
     query: string,
     limit: number,
-  ): SearchSessionsResult {
+    foreground?: ForegroundSession,
+  ): {
+    result: SearchSessionsResult;
+    foregroundRecovery?: ForegroundPendingRecovery;
+  } {
     const now = this.clock.now();
     return this.transaction(() => {
-      this.requireOwnedSession(principal, requester, true, "SESSION_NOT_REGISTERED");
-      const rows = this.database
-        .query<SessionRow, [string, number]>(
-          `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
-                  opt_in, lease_expires_ms
-           FROM sessions
-           WHERE principal_id = ? AND opt_in = 1 AND lease_expires_ms > ?`,
-        )
-        .all(principal.principalId, now)
-        .filter((row) =>
-          parseMetadataSearchFields(row.metadata_search).some((field) => field.includes(query)),
-        )
+      let preAdmissionMatches: readonly SessionRow[] = [];
+      if (foreground) {
+        this.assertForegroundClaim(principal, foreground, requester);
+        preAdmissionMatches = [...this.matchingActiveSessions(principal, query, now)]
+          .sort((left, right) => left.session_id.localeCompare(right.session_id))
+          .slice(0, limit);
+        const protectedSessionIds = new Set([
+          requester.sessionId,
+          ...preAdmissionMatches.map((row) => row.session_id),
+        ]);
+        this.admitForegroundInTransaction(
+          principal,
+          foreground,
+          requester,
+          protectedSessionIds,
+          now,
+        );
+      } else {
+        this.requireOwnedSession(principal, requester, true, "SESSION_NOT_REGISTERED");
+      }
+      const bySessionId = new Map(
+        [...preAdmissionMatches, ...this.matchingActiveSessions(principal, query, now)].map(
+          (row) => [row.session_id, row],
+        ),
+      );
+      const rows = [...bySessionId.values()]
         .sort((left, right) => left.session_id.localeCompare(right.session_id))
         .slice(0, limit);
       const matches = rows.map((row) => {
@@ -943,7 +1318,7 @@ export class BrokerStore {
           metadata: JSON.parse(row.metadata_json),
         });
       });
-      return {
+      const result = {
         scope: requester.broker,
         queryHash: hashNormalizedSearchQuery(
           query as Parameters<typeof hashNormalizedSearchQuery>[0],
@@ -951,22 +1326,91 @@ export class BrokerStore {
         requestedLimit: limit,
         matches,
       };
+      return foreground
+        ? {
+            result,
+            foregroundRecovery: this.pendingRecovery(
+              principal,
+              this.requireOwnedSession(principal, requester, true, "SESSION_NOT_REGISTERED"),
+              now,
+            ),
+          }
+        : { result };
     });
   }
 
-  replayEvents(
+  private matchingActiveSessions(
     principal: AuthenticatedClientPrincipal,
-    cursor?: string,
-  ): readonly PendingMessageEvent[] {
-    if (cursor === undefined) return [];
+    query: string,
+    now: number,
+  ): readonly SessionRow[] {
+    return this.database
+      .query<SessionRow, [string, number]>(
+        `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
+                opt_in, lease_expires_ms, displaced, last_foreground_ms, created_ms, updated_ms
+         FROM sessions
+         WHERE principal_id = ? AND opt_in = 1 AND lease_expires_ms > ?`,
+      )
+      .all(principal.principalId, now)
+      .filter((row) =>
+        parseMetadataSearchFields(row.metadata_search).some((field) => field.includes(query)),
+      );
+  }
+
+  private pendingRecovery(
+    principal: AuthenticatedClientPrincipal,
+    target: SessionRow,
+    now: number,
+  ): ForegroundPendingRecovery {
+    const headers = this.database
+      .query<MessageHeaderRow, [string, number, number]>(
+        `SELECT message_id, reply_to_message_id, source_session_id, target_session_id,
+                body_hash, body_bytes, state, enqueued_ms, expires_ms
+         FROM messages
+         WHERE target_session_id = ? AND state = 'PENDING' AND expires_ms > ?
+         ORDER BY enqueued_ms ASC, message_id ASC LIMIT ?`,
+      )
+      .all(target.session_id, now, DEFAULT_PENDING_LIST_LIMIT)
+      .map((row) => this.headerFromRow(row, principal.serverId));
+    return {
+      target: this.identity(principal.serverId, target.session_id),
+      requestedLimit: DEFAULT_PENDING_LIST_LIMIT,
+      eventCursor: this.currentEventCursor(principal),
+      headers,
+    };
+  }
+
+  private currentEventCursor(principal: AuthenticatedClientPrincipal): EventCursor {
+    const sequence = this.database
+      .query<SequenceRow, [string]>(
+        "SELECT sequence FROM principal_sequences WHERE principal_id = ?",
+      )
+      .get(principal.principalId)?.sequence;
+    return EventCursorSchema.parse(String(sequence ?? 0));
+  }
+
+  replayEvents(principal: AuthenticatedClientPrincipal, cursor?: string): EventReplaySnapshot {
     return this.transaction(() => {
-      const known = this.database
-        .query<CountRow, [string, number]>(
-          "SELECT COUNT(*) AS count FROM events WHERE principal_id = ? AND sequence = ?",
-        )
-        .get(principal.principalId, Number(cursor))?.count;
-      if (known !== 1) throw new BrokerOperationError("EVENT_CURSOR_EXPIRED");
-      return this.database
+      const highWater = this.currentEventCursor(principal);
+      if (cursor === undefined) return { cursor: highWater, events: [] };
+      const parsedCursor = EventCursorSchema.parse(cursor);
+      const cursorSequence = Number(parsedCursor);
+      const highWaterSequence = Number(highWater);
+      const retainedBoundaryRow =
+        cursorSequence >= highWaterSequence
+          ? undefined
+          : this.database
+              .query<{ readonly retained: number }, [string, number]>(
+                "SELECT 1 AS retained FROM events WHERE principal_id = ? AND sequence = ?",
+              )
+              .get(principal.principalId, cursorSequence === 0 ? 1 : cursorSequence);
+      const retainedBoundary =
+        cursorSequence >= highWaterSequence ||
+        (retainedBoundaryRow !== null && retainedBoundaryRow !== undefined);
+      if (cursorSequence > highWaterSequence || !retainedBoundary) {
+        throw new BrokerOperationError("EVENT_CURSOR_EXPIRED");
+      }
+      const events = this.database
         .query<EventRow, [string, number, string, number]>(
           `SELECT e.sequence, e.event_json
            FROM events e
@@ -975,8 +1419,9 @@ export class BrokerStore {
              AND s.principal_id = ? AND s.opt_in = 1 AND s.lease_expires_ms > ?
            ORDER BY e.sequence ASC`,
         )
-        .all(principal.principalId, Number(cursor), principal.principalId, this.clock.now())
+        .all(principal.principalId, cursorSequence, principal.principalId, this.clock.now())
         .map((row) => PendingMessageEventSchema.parse(JSON.parse(row.event_json)));
+      return { cursor: highWater, events };
     });
   }
 
@@ -1104,6 +1549,9 @@ export class BrokerStore {
       .query<StorageStats, []>(
         `SELECT
            (SELECT COUNT(*) FROM sessions) AS sessions,
+           (SELECT COUNT(*) FROM sessions WHERE opt_in = 1 AND lease_expires_ms > ${this.clock.now()})
+             AS activeSessions,
+           (SELECT COUNT(*) FROM sessions WHERE displaced = 1) AS displacedSessions,
            (SELECT COUNT(*) FROM messages) AS messages,
            (SELECT COUNT(*) FROM events) AS events,
            (SELECT COUNT(*) FROM enqueue_rate) AS enqueueRateRows,
@@ -1169,7 +1617,7 @@ export class BrokerStore {
     const row = this.database
       .query<SessionRow, [string]>(
         `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
-                opt_in, lease_expires_ms
+                opt_in, lease_expires_ms, displaced, last_foreground_ms, created_ms, updated_ms
          FROM sessions WHERE session_id = ?`,
       )
       .get(claim.sessionId);
@@ -1180,6 +1628,310 @@ export class BrokerStore {
       throw new BrokerOperationError(absentCode);
     }
     return row;
+  }
+
+  private requireRecoverableSession(
+    principal: AuthenticatedClientPrincipal,
+    claim: SessionIdentity,
+    absentCode: "SESSION_NOT_REGISTERED" | "TARGET_NOT_REGISTERED",
+  ): SessionRow {
+    const row = this.requireOwnedSession(principal, claim, false, absentCode);
+    const active = row.opt_in === 1 && row.lease_expires_ms > this.clock.now();
+    if (!active && row.displaced !== 1) throw new BrokerOperationError(absentCode);
+    return row;
+  }
+
+  private activeSessionCount(principalId: string, now: number): number {
+    return (
+      this.database
+        .query<CountRow, [string, number]>(
+          `SELECT COUNT(*) AS count FROM sessions
+           WHERE principal_id = ? AND opt_in = 1 AND lease_expires_ms > ?`,
+        )
+        .get(principalId, now)?.count ?? 0
+    );
+  }
+
+  private assertForegroundClaim(
+    principal: AuthenticatedClientPrincipal,
+    foreground: ForegroundSession,
+    claim: SessionIdentity | undefined,
+  ): string {
+    const sessionId = this.canonicalSessionId(principal, foreground.hostSessionId);
+    if (claim) {
+      this.assertClaimScope(principal, claim);
+      if (claim.sessionId !== sessionId) throw new BrokerOperationError("FORBIDDEN");
+    }
+    return sessionId;
+  }
+
+  private admitForegroundInTransaction(
+    principal: AuthenticatedClientPrincipal,
+    foreground: ForegroundSession,
+    claim: SessionIdentity | undefined,
+    protectedSessionIds: ReadonlySet<string>,
+    now: number,
+  ): { readonly row: SessionRow; readonly existed: boolean } {
+    const sessionId = this.assertForegroundClaim(principal, foreground, claim);
+    const existing = this.database
+      .query<SessionRow, [string, string]>(
+        `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
+                opt_in, lease_expires_ms, displaced, last_foreground_ms, created_ms, updated_ms
+         FROM sessions WHERE principal_id = ? AND host_session_id = ?`,
+      )
+      .get(principal.principalId, foreground.hostSessionId);
+    if (existing && existing.session_id !== sessionId) {
+      throw new Error("Broker canonical session identity conflicts with persisted state.");
+    }
+    if (!existing) {
+      this.ensureDurableForegroundCapacity(principal, protectedSessionIds, now);
+      this.database.run(
+        `INSERT INTO sessions(
+           principal_id, host_session_id, session_id, metadata_json, metadata_search,
+           opt_in, lease_expires_ms, created_ms, updated_ms, displaced, last_foreground_ms
+         ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 1, NULL)`,
+        principal.principalId,
+        foreground.hostSessionId,
+        sessionId,
+        canonicalMetadataJson(foreground.metadata),
+        metadataSearchText(foreground.metadata),
+        now + this.limits.sessionLeaseSeconds * 1_000,
+        now,
+        now,
+      );
+    } else {
+      this.database.run(
+        `UPDATE sessions SET metadata_json = ?, metadata_search = ?, updated_ms = ?
+         WHERE principal_id = ? AND session_id = ?`,
+        canonicalMetadataJson(foreground.metadata),
+        metadataSearchText(foreground.metadata),
+        now,
+        principal.principalId,
+        sessionId,
+      );
+    }
+
+    const beforeAdmission = this.requireOwnedSession(
+      principal,
+      this.identity(principal.serverId, sessionId),
+      false,
+      "SESSION_NOT_REGISTERED",
+    );
+    if (beforeAdmission.opt_in !== 1 || beforeAdmission.lease_expires_ms <= now) {
+      this.evictForAdmission(principal, new Set([...protectedSessionIds, sessionId]), now);
+    }
+    const leaseExpires = now + this.limits.sessionLeaseSeconds * 1_000;
+    this.database.run(
+      `UPDATE sessions
+       SET opt_in = 1, displaced = 0, lease_expires_ms = ?, last_foreground_ms = ?, updated_ms = ?
+       WHERE principal_id = ? AND session_id = ?`,
+      leaseExpires,
+      now,
+      now,
+      principal.principalId,
+      sessionId,
+    );
+    return {
+      row: this.requireOwnedSession(
+        principal,
+        this.identity(principal.serverId, sessionId),
+        true,
+        "SESSION_NOT_REGISTERED",
+      ),
+      existed: existing !== null,
+    };
+  }
+
+  private admitDisplacedDependency(
+    principal: AuthenticatedClientPrincipal,
+    claim: SessionIdentity,
+    protectedSessionIds: ReadonlySet<string>,
+    now: number,
+    absentCode: "SESSION_NOT_REGISTERED" | "TARGET_NOT_REGISTERED",
+  ): SessionRow {
+    const existing = this.requireOwnedSession(principal, claim, false, absentCode);
+    if (existing.opt_in === 1 && existing.lease_expires_ms > now) return existing;
+    if (existing.displaced !== 1) throw new BrokerOperationError(absentCode);
+    this.evictForAdmission(principal, protectedSessionIds, now);
+    this.database.run(
+      `UPDATE sessions SET opt_in = 1, displaced = 0, lease_expires_ms = ?, updated_ms = ?
+       WHERE principal_id = ? AND session_id = ?`,
+      now + this.limits.sessionLeaseSeconds * 1_000,
+      now,
+      principal.principalId,
+      claim.sessionId,
+    );
+    return this.requireOwnedSession(principal, claim, true, absentCode);
+  }
+
+  private evictForAdmission(
+    principal: AuthenticatedClientPrincipal,
+    protectedSessionIds: ReadonlySet<string>,
+    now: number,
+  ): void {
+    if (
+      this.activeSessionCount(principal.principalId, now) <
+      this.limits.maxActiveSessionsPerPrincipal
+    ) {
+      return;
+    }
+    const candidates = this.database
+      .query<SessionRow, [string, number]>(
+        `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
+                opt_in, lease_expires_ms, displaced, last_foreground_ms, created_ms, updated_ms
+         FROM sessions
+         WHERE principal_id = ? AND opt_in = 1 AND lease_expires_ms > ?
+         ORDER BY CASE WHEN last_foreground_ms IS NULL THEN 0 ELSE 1 END ASC,
+                  CASE WHEN last_foreground_ms IS NULL THEN created_ms ELSE last_foreground_ms END ASC,
+                  created_ms ASC,
+                  session_id ASC`,
+      )
+      .all(principal.principalId, now);
+    const candidate = candidates.find((row) => !protectedSessionIds.has(row.session_id));
+    if (!candidate) throw new BrokerOperationError("RATE_LIMITED", { retryAfterMs: 100 });
+    this.database.run(
+      `UPDATE sessions SET opt_in = 0, displaced = 1, updated_ms = ?
+       WHERE principal_id = ? AND session_id = ?`,
+      now,
+      principal.principalId,
+      candidate.session_id,
+    );
+  }
+
+  private ensureDurableForegroundCapacity(
+    principal: AuthenticatedClientPrincipal,
+    protectedSessionIds: ReadonlySet<string>,
+    now: number,
+  ): void {
+    const principalSessions =
+      this.database
+        .query<CountRow, [string]>("SELECT COUNT(*) AS count FROM sessions WHERE principal_id = ?")
+        .get(principal.principalId)?.count ?? 0;
+    if (principalSessions >= this.limits.maxSessionsPerPrincipal) {
+      this.reclaimStateFreeBackgroundSession(principal.principalId, protectedSessionIds, now);
+    }
+    const globalSessions =
+      this.database.query<CountRow, []>("SELECT COUNT(*) AS count FROM sessions").get()?.count ?? 0;
+    if (globalSessions >= this.limits.maxSessionsGlobal) {
+      this.reclaimStateFreeBackgroundSession(undefined, protectedSessionIds, now);
+    }
+  }
+
+  private reclaimStateFreeBackgroundSession(
+    principalId: string | undefined,
+    protectedSessionIds: ReadonlySet<string>,
+    now: number,
+  ): void {
+    const candidates =
+      principalId === undefined
+        ? this.database
+            .query<SessionRow, [number]>(
+              `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
+                      opt_in, lease_expires_ms, displaced, last_foreground_ms, created_ms, updated_ms
+               FROM sessions s
+               WHERE last_foreground_ms IS NULL AND (opt_in = 0 OR lease_expires_ms <= ?)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM messages m
+                   WHERE m.source_session_id = s.session_id OR m.target_session_id = s.session_id
+                 )
+                 AND NOT EXISTS (SELECT 1 FROM events e WHERE e.target_session_id = s.session_id)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM enqueue_rate r WHERE r.source_session_id = s.session_id
+                 )
+               ORDER BY created_ms ASC,
+                        session_id ASC`,
+            )
+            .all(now)
+        : this.database
+            .query<SessionRow, [string, number]>(
+              `SELECT principal_id, host_session_id, session_id, metadata_json, metadata_search,
+                      opt_in, lease_expires_ms, displaced, last_foreground_ms, created_ms, updated_ms
+               FROM sessions s
+               WHERE principal_id = ? AND last_foreground_ms IS NULL
+                 AND (opt_in = 0 OR lease_expires_ms <= ?)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM messages m
+                   WHERE m.source_session_id = s.session_id OR m.target_session_id = s.session_id
+                 )
+                 AND NOT EXISTS (SELECT 1 FROM events e WHERE e.target_session_id = s.session_id)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM enqueue_rate r WHERE r.source_session_id = s.session_id
+                 )
+               ORDER BY created_ms ASC,
+                        session_id ASC`,
+            )
+            .all(principalId, now);
+    const candidate = candidates.find((row) => !protectedSessionIds.has(row.session_id));
+    if (!candidate) throw new BrokerOperationError("RATE_LIMITED", { retryAfterMs: 100 });
+    this.database.run("DELETE FROM sessions WHERE session_id = ?", candidate.session_id);
+  }
+
+  private enqueueResolved(
+    principal: AuthenticatedClientPrincipal,
+    source: SessionRow,
+    target: SessionRow,
+    body: string,
+    ttlSeconds: number,
+    correlationId: string,
+    now: number,
+    replyToMessageId?: string,
+  ): { receipt: EnqueueMessageReceipt; event: PendingMessageEvent } {
+    const expires = now + ttlSeconds * 1_000;
+    const bodyHash = bodySha256(body);
+    const bodyBytes = Buffer.byteLength(body, "utf8");
+    const messageId = Buffer.from(this.random.bytes(32)).toString("hex");
+    this.enforceEnqueueRateLimits(principal, source.session_id, now);
+    this.enforceDurableMessageLimits(principal, source.session_id, now);
+    this.enforcePendingLimits(principal, target.session_id, now);
+
+    this.database.run(
+      `INSERT INTO messages(
+         message_id, source_session_id, target_session_id, target_principal_id,
+         body_hash, body_bytes, body, state, enqueued_ms, expires_ms, reply_to_message_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
+      messageId,
+      source.session_id,
+      target.session_id,
+      target.principal_id,
+      bodyHash,
+      bodyBytes,
+      body,
+      now,
+      expires,
+      replyToMessageId ?? null,
+    );
+    this.database.run(
+      "INSERT INTO enqueue_rate(principal_id, source_session_id, occurred_ms) VALUES (?, ?, ?)",
+      principal.principalId,
+      source.session_id,
+      now,
+    );
+
+    const header = this.headerFromRow(
+      {
+        message_id: messageId,
+        reply_to_message_id: replyToMessageId ?? null,
+        source_session_id: source.session_id,
+        target_session_id: target.session_id,
+        body_hash: bodyHash,
+        body_bytes: bodyBytes,
+        state: "PENDING",
+        enqueued_ms: now,
+        expires_ms: expires,
+      },
+      principal.serverId,
+    );
+    const event = this.appendEvent(principal, target.session_id, correlationId, header, now);
+    return {
+      receipt: EnqueueMessageReceiptSchema.parse({
+        messageId,
+        state: "PENDING",
+        bodyHash,
+        bodyBytes,
+        expiresAt: iso(expires),
+      }),
+      event,
+    };
   }
 
   private enforceRegistrationRate(principal: AuthenticatedClientPrincipal, now: number): void {
@@ -1515,6 +2267,7 @@ export class BrokerStore {
   private headerFromRow(row: MessageHeaderRow, serverId: string): PendingMessageHeader {
     return {
       messageId: row.message_id,
+      ...(row.reply_to_message_id === null ? {} : { replyToMessageId: row.reply_to_message_id }),
       source: this.identity(serverId, row.source_session_id),
       target: this.identity(serverId, row.target_session_id),
       bodyHash: row.body_hash,
@@ -1548,7 +2301,7 @@ export class BrokerStore {
       .get(principal.principalId)?.sequence;
     if (!sequence) throw new Error("Event sequence was not allocated.");
     const event = PendingMessageEventSchema.parse({
-      protocolVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
       event: "agentbus.pending",
       eventId: String(sequence),
       correlationId,
@@ -1590,6 +2343,7 @@ export class BrokerStore {
 
 type ConsumedMessageResultLike = {
   messageId: string;
+  replyToMessageId?: string;
   source: SessionIdentity;
   target: SessionIdentity;
   body: string;
@@ -1610,6 +2364,7 @@ export const DEFAULT_STORE_LIMITS: StoreLimits = Object.freeze({
   maxActiveSessionsPerPrincipal: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   maxSessionsPerPrincipal: 1_024,
   maxSessionsGlobal: 4_096,
+  foregroundSessionReserve: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   registrationsPerPrincipalPerMinute: MAX_ACTIVE_SESSIONS_PER_PRINCIPAL,
   enqueuePerPrincipalPerMinute: 120,
   enqueuePerSessionPerMinute: 60,
