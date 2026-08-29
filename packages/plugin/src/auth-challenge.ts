@@ -6,6 +6,7 @@ import {
   BrokerServerIdentitySchema,
   generateAuthChallengeNonce,
   verifyAuthChallengeResponse,
+  verifyAuthChallengeResponseVersion,
 } from "@opencode-agentbus/protocol";
 import type {
   BrokerServerIdentity,
@@ -13,7 +14,7 @@ import type {
   TrustedConnectionConfig,
 } from "@opencode-agentbus/protocol";
 
-import { SAFE_MODEL_ERRORS, SafeModelError } from "./errors";
+import { SAFE_MODEL_ERRORS, BrokerProtocolMismatchError, SafeModelError } from "./errors";
 
 export type PluginFetch = (url: string | URL, init?: RequestInit) => Promise<Response>;
 type ChallengeReader = Pick<
@@ -176,8 +177,19 @@ export async function authenticateBrokerListener(
     readerHandled = true;
     const candidate = await readBoundedChallengeBody(response, input.controller.signal);
     const challenge = AuthChallengeResponseSchema.safeParse(candidate);
+    const verificationInput = {
+      token: input.credential.token,
+      expectedServerId: input.credential.serverId,
+      expectedClientNonce: clientNonce,
+      response: candidate,
+    } as const;
+    if (!challenge.success) {
+      if (verifyAuthChallengeResponseVersion(verificationInput, 1)) {
+        throw new BrokerProtocolMismatchError();
+      }
+      throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+    }
     if (
-      !challenge.success ||
       !verifyAuthChallengeResponse({
         token: input.credential.token,
         expectedServerId: input.credential.serverId,
@@ -195,7 +207,8 @@ export async function authenticateBrokerListener(
       throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
     }
     return broker;
-  } catch {
+  } catch (error) {
+    if (error instanceof BrokerProtocolMismatchError) throw error;
     throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
   } finally {
     clearTimeout(timeout);

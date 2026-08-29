@@ -1,6 +1,8 @@
 import { constants } from "node:fs";
 import type { Stats } from "node:fs";
 import { lstat, open } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import {
   CREDENTIAL_FILE_MODE,
@@ -27,9 +29,29 @@ export interface AgentBusTrustedOptions {
   readonly endpoint?: unknown;
   readonly timeoutMs?: unknown;
   readonly credentialFilePath?: unknown;
+  readonly autoStartBroker?: unknown;
+  readonly brokerStartupTimeoutMs?: unknown;
+  readonly wakeOnMessage?: unknown;
+  readonly focusOnReceiveApproval?: unknown;
 }
 
 export type TrustedEnvironment = Readonly<Record<string, string | undefined>>;
+
+const TRUSTED_OPTION_KEYS = new Set([
+  "endpoint",
+  "timeoutMs",
+  "credentialFilePath",
+  "autoStartBroker",
+  "brokerStartupTimeoutMs",
+  "wakeOnMessage",
+  "focusOnReceiveApproval",
+]);
+
+function configuredBoolean(value: unknown): unknown {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return value;
+}
 
 function invalidCredential(): SafeModelError {
   return new SafeModelError(SAFE_MODEL_ERRORS.INVALID_CREDENTIAL);
@@ -39,17 +61,41 @@ export function resolveTrustedConnectionConfig(
   options: AgentBusTrustedOptions,
   environment: TrustedEnvironment = process.env,
 ): TrustedConnectionConfig {
+  if (Object.keys(options).some((key) => !TRUSTED_OPTION_KEYS.has(key))) {
+    throw new SafeModelError(SAFE_MODEL_ERRORS.INVALID_CONFIG);
+  }
   const credentialFilePath =
-    options.credentialFilePath ?? environment.OPENCODE_AGENTBUS_CREDENTIAL_FILE;
+    options.credentialFilePath ??
+    environment.OPENCODE_AGENTBUS_CREDENTIAL_FILE ??
+    join(environment.HOME ?? homedir(), ".config", "opencode-agentbus", "credential.json");
   const endpoint = options.endpoint ?? environment.OPENCODE_AGENTBUS_ENDPOINT;
   const configuredTimeout = options.timeoutMs ?? environment.OPENCODE_AGENTBUS_TIMEOUT_MS;
+  const configuredStartupTimeout =
+    options.brokerStartupTimeoutMs ?? environment.OPENCODE_AGENTBUS_BROKER_STARTUP_TIMEOUT_MS;
   const timeoutMs =
     typeof configuredTimeout === "string" && configuredTimeout.length > 0
       ? Number(configuredTimeout)
       : configuredTimeout;
+  const brokerStartupTimeoutMs =
+    typeof configuredStartupTimeout === "string" && configuredStartupTimeout.length > 0
+      ? Number(configuredStartupTimeout)
+      : configuredStartupTimeout;
+  const configuredAutoStart =
+    options.autoStartBroker ?? environment.OPENCODE_AGENTBUS_AUTO_START_BROKER;
+  const autoStartBroker = configuredBoolean(configuredAutoStart);
+  const wakeOnMessage = configuredBoolean(
+    options.wakeOnMessage ?? environment.OPENCODE_AGENTBUS_WAKE_ON_MESSAGE,
+  );
+  const focusOnReceiveApproval = configuredBoolean(
+    options.focusOnReceiveApproval ?? environment.OPENCODE_AGENTBUS_FOCUS_ON_RECEIVE_APPROVAL,
+  );
   const candidate = {
     ...(endpoint === undefined ? {} : { endpoint }),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(autoStartBroker === undefined ? {} : { autoStartBroker }),
+    ...(brokerStartupTimeoutMs === undefined ? {} : { brokerStartupTimeoutMs }),
+    ...(wakeOnMessage === undefined ? {} : { wakeOnMessage }),
+    ...(focusOnReceiveApproval === undefined ? {} : { focusOnReceiveApproval }),
     credentialFilePath,
   };
   const parsed = TrustedConnectionConfigSchema.safeParse(candidate);
@@ -90,9 +136,24 @@ export async function readCredentialFileSecure(
   credentialFilePath: string,
   testHooks: CredentialReadTestHooks = {},
 ): Promise<SecureCredentialSnapshot> {
+  const snapshot = await readCredentialFileIfPresentSecure(credentialFilePath, testHooks);
+  if (!snapshot) throw invalidCredential();
+  return snapshot;
+}
+
+export async function readCredentialFileIfPresentSecure(
+  credentialFilePath: string,
+  testHooks: CredentialReadTestHooks = {},
+): Promise<SecureCredentialSnapshot | undefined> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const pathStat = await lstat(credentialFilePath);
+    let pathStat: Stats;
+    try {
+      pathStat = await lstat(credentialFilePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
     if (!secureRegularFile(pathStat)) throw invalidCredential();
     await testHooks.afterPathCheck?.();
 

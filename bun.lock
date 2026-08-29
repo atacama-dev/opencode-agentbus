@@ -13,6 +13,9 @@
     "packages/broker": {
       "name": "@opencode-agentbus/broker",
       "version": "0.1.0",
+      "bin": {
+        "opencode-agentbus-broker": "./dist/cli.js",
+      },
       "dependencies": {
         "@modelcontextprotocol/sdk": "1.30.0",
         "@opencode-agentbus/protocol": "workspace:0.1.0",
@@ -24,6 +27,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@modelcontextprotocol/sdk": "1.30.0",
+        "@opencode-agentbus/broker": "workspace:0.1.0",
         "@opencode-agentbus/protocol": "workspace:0.1.0",
         "@opencode-ai/plugin": "1.18.19",
       },

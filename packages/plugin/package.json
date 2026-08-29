@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
+    "@opencode-agentbus/broker": "workspace:0.1.0",
     "@opencode-agentbus/protocol": "workspace:0.1.0",
     "@opencode-ai/plugin": "1.18.19"
   }

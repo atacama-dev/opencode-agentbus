@@ -8,6 +8,18 @@ export const SAFE_MODEL_ERRORS = Object.freeze({
   RECEIVE_DENIED: "Agent Bus receive was not approved; the message remains pending.",
 } as const);
 
+export const OPERATOR_ERRORS = Object.freeze({
+  PROTOCOL_MISMATCH:
+    "Agent Bus was upgraded, but the detached broker is still using protocol v1. Stop and restart the old Agent Bus broker manually before retrying.",
+} as const);
+
+export class BrokerProtocolMismatchError extends Error {
+  constructor() {
+    super(OPERATOR_ERRORS.PROTOCOL_MISMATCH);
+    this.name = "BrokerProtocolMismatchError";
+  }
+}
+
 export class SafeModelError extends Error {
   constructor(message: (typeof SAFE_MODEL_ERRORS)[keyof typeof SAFE_MODEL_ERRORS]) {
     super(message);

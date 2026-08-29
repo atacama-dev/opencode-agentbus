@@ -1,12 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { createHmac } from "node:crypto";
 
 import {
   AUTH_CHALLENGE_CLIENT_NONCE_HEADER,
   AUTH_CHALLENGE_CONTENT_TYPE,
+  AUTH_CHALLENGE_PROOF_DOMAIN,
+  verifyAuthChallengeResponseVersion,
 } from "@opencode-agentbus/protocol";
 
 import { authenticateBrokerListener } from "../src/auth-challenge";
-import { SAFE_MODEL_ERRORS } from "../src/errors";
+import { SAFE_MODEL_ERRORS, BrokerProtocolMismatchError } from "../src/errors";
 import { CONFIG, challengeResponse, credential } from "./helpers";
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -23,7 +26,73 @@ function challengeJson(init?: RequestInit): string {
   return JSON.stringify(challengeResponse(nonce));
 }
 
+function legacyChallengeJson(init?: RequestInit): string {
+  const clientNonce = new Headers(init?.headers).get(AUTH_CHALLENGE_CLIENT_NONCE_HEADER);
+  if (!clientNonce) throw new Error("missing test nonce");
+  const brokerId = "broker_legacy_v1";
+  const serverId = "server_01";
+  const serverNonce = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const encoder = new TextEncoder();
+  const domain = encoder.encode(AUTH_CHALLENGE_PROOF_DOMAIN);
+  const fields = ["1", brokerId, serverId, clientNonce, serverNonce].map((field) =>
+    encoder.encode(field),
+  );
+  const buffer = new ArrayBuffer(
+    domain.byteLength + 1 + fields.reduce((sum, field) => sum + 4 + field.byteLength, 0),
+  );
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  bytes.set(domain);
+  let offset = domain.byteLength + 1;
+  for (const field of fields) {
+    view.setUint32(offset, field.byteLength, false);
+    offset += 4;
+    bytes.set(field, offset);
+    offset += field.byteLength;
+  }
+  const proof = createHmac("sha256", Uint8Array.from(Buffer.from(credential().token, "base64url")))
+    .update(bytes)
+    .digest("hex");
+  return JSON.stringify({
+    protocolVersion: 1,
+    brokerId,
+    serverId,
+    clientNonce,
+    serverNonce,
+    proof,
+  });
+}
+
 describe("bounded broker authentication challenge", () => {
+  test("distinguishes an authenticated detached version-1 broker for operator recovery", async () => {
+    let candidate: unknown;
+    const error = await authenticateBrokerListener({
+      config: CONFIG,
+      controller: new AbortController(),
+      credential: credential(),
+      fetchImplementation: async (_url, init) => {
+        candidate = JSON.parse(legacyChallengeJson(init));
+        return new Response(JSON.stringify(candidate), {
+          headers: { "Content-Type": AUTH_CHALLENGE_CONTENT_TYPE },
+        });
+      },
+    }).catch((failure: unknown) => failure);
+
+    const response = candidate as { clientNonce?: string };
+    expect(
+      verifyAuthChallengeResponseVersion(
+        {
+          token: credential().token,
+          expectedServerId: "server_01",
+          expectedClientNonce: response.clientNonce ?? "missing",
+          response: candidate,
+        },
+        1,
+      ),
+    ).toBe(true);
+    expect(error).toBeInstanceOf(BrokerProtocolMismatchError);
+  });
+
   test.each([
     [
       "missing",
