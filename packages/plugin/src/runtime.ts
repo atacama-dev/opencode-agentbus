@@ -9,6 +9,10 @@ import {
   DeregisterSessionResponseSchema,
   EnqueueMessageRequestSchema,
   EnqueueMessageResponseSchema,
+  EventCursorSchema,
+  ForegroundIdentityRequestSchema,
+  ForegroundIdentityResponseSchema,
+  ForegroundSessionSchema,
   HandshakeRequestSchema,
   HandshakeResponseSchema,
   HeartbeatSessionRequestSchema,
@@ -16,6 +20,7 @@ import {
   HostSessionIdSchema,
   ListPendingMessagesRequestSchema,
   ListPendingMessagesResponseSchema,
+  MAX_EVENT_REPLAY_WINDOW,
   METHODS,
   PROTOCOL_VERSION,
   PeekNextMessageRequestSchema,
@@ -24,6 +29,8 @@ import {
   ReceivePermissionMetadataSchema,
   RegisterSessionRequestSchema,
   RegisterSessionResponseSchema,
+  ReplyMessageRequestSchema,
+  ReplyMessageResponseSchema,
   SearchSessionsRequestSchema,
   SearchSessionsResponseSchema,
   SessionIdSchema,
@@ -31,12 +38,14 @@ import {
   SessionMetadataSchema,
   brokerScopeFingerprint,
   consumedResultMatchesHeader,
+  enqueueResultMatchesRequest,
   hashNormalizedSearchQuery,
   listPendingResultMatchesRequest,
   normalizeSearchQuery,
   pendingEventMatchesPrincipalBindings,
   receivePermissionResource,
   registrationResultMatchesInput,
+  replyResultMatchesRequest,
   responseCorrelatesToRequest,
   sameSessionIdentity,
   searchPermissionResource,
@@ -46,6 +55,10 @@ import {
 } from "@opencode-agentbus/protocol";
 import type {
   ApplicationOperationRequest,
+  EventCursor,
+  ForegroundIdentityResult,
+  ForegroundPendingRecovery,
+  ForegroundSession,
   PendingMessageEvent,
   PendingMessageHeader,
   PrincipalSessionBinding,
@@ -73,7 +86,11 @@ interface Schema<T> {
   parse(value: unknown): T;
 }
 
-export type AgentBusToolContext = Pick<ToolContext, "sessionID" | "ask">;
+export type TrustedForegroundToolContext = Pick<
+  ToolContext,
+  "sessionID" | "directory" | "worktree"
+>;
+export type AgentBusToolContext = TrustedForegroundToolContext & Pick<ToolContext, "ask">;
 
 export interface RuntimeScheduler {
   readonly set: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
@@ -86,16 +103,20 @@ export interface AgentBusRuntimeOptions {
   readonly channelFactory?: BrokerChannelFactory;
   readonly eventStreamFactory?: PrincipalEventStreamFactory;
   readonly notifyPending?: (count: number) => Promise<void>;
+  readonly notifyPendingForSession?: (hostSessionId: string, count: number) => Promise<void>;
+  readonly updatePending?: (hostSessionId: string, count: number) => void;
+  readonly resolveForegroundSession?: (
+    context: TrustedForegroundToolContext,
+  ) => Promise<ForegroundSession>;
   readonly createRequestId?: () => string;
   readonly reconnectDelayMs?: number;
   readonly bootstrapRetryDelayMs?: number;
   readonly scheduler?: RuntimeScheduler;
 }
 
-export interface HostSessionRegistration {
-  readonly hostSessionId: string;
-  readonly metadata: SessionMetadata;
-}
+export type HostSessionRegistration = Readonly<
+  Omit<ForegroundSession, "hostSessionId"> & { readonly hostSessionId: string }
+>;
 
 interface DesiredSession {
   readonly metadata: SessionMetadata;
@@ -104,11 +125,51 @@ interface DesiredSession {
 
 interface RegistrationRecord {
   readonly hostSessionId: ReturnType<typeof HostSessionIdSchema.parse>;
-  registration: RegistrationResult;
+  registration: RegistrationResult | ForegroundIdentityResult;
   binding: PrincipalSessionBinding;
+  active: boolean;
+  recovered: boolean;
   readonly approvedTargets: Map<string, SessionIdentity>;
   heartbeatTimer?: ReturnType<typeof setTimeout>;
   pendingCount: number;
+  pendingObservationIssued: number;
+  pendingObservationApplied: number;
+  pendingFirstHeader: PendingMessageHeader | undefined;
+  pendingEventCursor?: EventCursor;
+}
+
+interface PrincipalStreamCoverage {
+  readonly stream: PrincipalEventStream;
+  readonly membershipVersion: number;
+  readonly through: EventCursor;
+}
+
+interface PrincipalResumePoint {
+  readonly cursor?: EventCursor;
+  readonly stale: boolean;
+}
+
+interface PendingRecoveryOverride {
+  readonly record: RegistrationRecord;
+  readonly observation: number;
+  readonly deferEmpty: boolean;
+}
+
+interface PendingRecoveryEntry {
+  readonly record: RegistrationRecord;
+  readonly recovery: ForegroundPendingRecovery;
+  readonly observation: number;
+  readonly deferEmpty: boolean;
+}
+
+interface PendingRecoveryResult {
+  readonly headers: readonly PendingMessageHeader[];
+  readonly observation: number;
+}
+
+interface ForegroundRegistration {
+  readonly record: RegistrationRecord;
+  readonly foreground: ForegroundSession;
 }
 
 interface SendInput {
@@ -117,10 +178,19 @@ interface SendInput {
   readonly ttlSeconds?: number | undefined;
 }
 
+interface ReplyInput {
+  readonly messageId: string;
+  readonly body: string;
+  readonly ttlSeconds?: number | undefined;
+}
+
 interface SearchInput {
   readonly query: string;
   readonly limit?: number | undefined;
 }
+
+const MAX_RECEIVE_OBSERVATION_ATTEMPTS = 3;
+const MAX_PRINCIPAL_CONVERGENCE_ATTEMPTS = 5;
 
 function safeRequestId(requestId: string): string {
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(requestId)) {
@@ -138,6 +208,7 @@ function parseInput<T>(schema: Schema<T>, value: unknown): T {
 function samePendingHeader(left: PendingMessageHeader, right: PendingMessageHeader): boolean {
   return (
     left.messageId === right.messageId &&
+    left.replyToMessageId === right.replyToMessageId &&
     sameSessionIdentity(left.source, right.source) &&
     sameSessionIdentity(left.target, right.target) &&
     left.bodyHash === right.bodyHash &&
@@ -150,6 +221,12 @@ function samePendingHeader(left: PendingMessageHeader, right: PendingMessageHead
 
 function sameMetadata(left: SessionMetadata, right: SessionMetadata): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function compareEventCursors(left: string, right: string): number {
+  const parsedLeft = BigInt(left);
+  const parsedRight = BigInt(right);
+  return parsedLeft < parsedRight ? -1 : parsedLeft > parsedRight ? 1 : 0;
 }
 
 class LifecycleInvalidatedError extends Error {}
@@ -166,6 +243,11 @@ export class AgentBusRuntime {
   private readonly channelFactory: BrokerChannelFactory;
   private readonly eventStreamFactory: PrincipalEventStreamFactory;
   private readonly notifyPending: (count: number) => Promise<void>;
+  private readonly notifyPendingForSession: (hostSessionId: string, count: number) => Promise<void>;
+  private readonly updatePending: (hostSessionId: string, count: number) => void;
+  private readonly resolveForegroundSession:
+    | ((context: TrustedForegroundToolContext) => Promise<ForegroundSession>)
+    | undefined;
   private readonly createRequestId: () => string;
   private readonly reconnectDelayMs: number;
   private readonly bootstrapRetryDelayMs: number;
@@ -176,6 +258,14 @@ export class AgentBusRuntime {
   private eventStream: PrincipalEventStream | undefined;
   private connectionWork: Promise<void> | undefined;
   private eventWork: Promise<void> = Promise.resolve();
+  private pendingRecoveryWork: Promise<void> = Promise.resolve();
+  private pendingRecoveryLaneActive = false;
+  private readonly authenticatedEventBuffer = new Map<string, PendingMessageEvent>();
+  private eventBufferOverflowCursor: EventCursor | undefined;
+  private bufferedEventRecoveryScheduled = false;
+  private streamCoverage: PrincipalStreamCoverage | undefined;
+  private resumePoint: PrincipalResumePoint | undefined;
+  private registrationMembershipVersion = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private bootstrapRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private bootstrapWork: Promise<void> | undefined;
@@ -191,6 +281,9 @@ export class AgentBusRuntime {
     this.channelFactory = options.channelFactory ?? defaultBrokerChannelFactory;
     this.eventStreamFactory = options.eventStreamFactory ?? defaultPrincipalEventStreamFactory;
     this.notifyPending = options.notifyPending ?? (async () => undefined);
+    this.notifyPendingForSession = options.notifyPendingForSession ?? (async () => undefined);
+    this.updatePending = options.updatePending ?? (() => undefined);
+    this.resolveForegroundSession = options.resolveForegroundSession;
     this.createRequestId =
       options.createRequestId ??
       (() => safeRequestId(`req_${crypto.randomUUID().replaceAll("-", "")}`));
@@ -238,10 +331,17 @@ export class AgentBusRuntime {
     }
   }
 
-  async send(input: SendInput, context: AgentBusToolContext): Promise<ToolResult> {
+  async send(
+    input: SendInput,
+    context: AgentBusToolContext,
+    trustedForeground?: ForegroundSession,
+  ): Promise<ToolResult> {
     try {
       const generation = this.activeGeneration();
-      const record = await this.ensureRegistration(context.sessionID);
+      const { record, foreground } = await this.ensureForegroundRegistration(
+        context,
+        trustedForeground,
+      );
       this.assertActive(generation);
       const targetHandle = parseInput(SessionIdSchema, input.target);
       const target =
@@ -259,10 +359,13 @@ export class AgentBusRuntime {
           target,
           body: input.body,
           ttlSeconds: input.ttlSeconds ?? DEFAULT_MESSAGE_TTL_SECONDS,
+          foreground,
         },
       });
       const response = await this.requestAndParse(request, EnqueueMessageResponseSchema);
       if (!response.ok) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+      if (!enqueueResultMatchesRequest(request, response.result)) throw this.invalidResponse();
+      await this.acceptForegroundRecovery(record, response, generation);
       const receipt = {
         type: "agentbus_send_receipt",
         ...response.result,
@@ -284,33 +387,113 @@ export class AgentBusRuntime {
     }
   }
 
-  async receive(context: AgentBusToolContext): Promise<ToolResult> {
+  async reply(
+    input: ReplyInput,
+    context: AgentBusToolContext,
+    trustedForeground?: ForegroundSession,
+  ): Promise<ToolResult> {
     try {
       const generation = this.activeGeneration();
-      const record = await this.ensureRegistration(context.sessionID);
+      const { record, foreground } = await this.ensureForegroundRegistration(
+        context,
+        trustedForeground,
+      );
       this.assertActive(generation);
-      const listedHeaders = await this.recoverPending(record, false);
-      const peekRequest = parseInput(PeekNextMessageRequestSchema, {
+      const request = parseInput(ReplyMessageRequestSchema, {
         protocolVersion: PROTOCOL_VERSION,
         requestId: this.nextRequestId(),
-        method: METHODS.PEEK_NEXT_MESSAGE,
-        params: { target: record.registration.identity },
+        method: METHODS.REPLY_MESSAGE,
+        params: {
+          source: record.registration.identity,
+          messageId: input.messageId,
+          body: input.body,
+          ttlSeconds: input.ttlSeconds ?? DEFAULT_MESSAGE_TTL_SECONDS,
+          foreground,
+        },
       });
-      const peekResponse = await this.requestAndParse(peekRequest, PeekNextMessageResponseSchema);
-      if (!peekResponse.ok) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
-      const header = peekResponse.result.header;
-      if (header === null) {
-        return {
-          title: "Agent Bus inbox",
-          output: JSON.stringify({ type: "agentbus_receive_status", state: "EMPTY" }),
-          metadata: { type: "agentbus_receive_status", state: "EMPTY" },
-        };
+      const response = await this.requestAndParse(request, ReplyMessageResponseSchema);
+      if (!response.ok) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+      if (!replyResultMatchesRequest(request, response.result)) throw this.invalidResponse();
+      await this.acceptForegroundRecovery(record, response, generation);
+      const receipt = {
+        type: "agentbus_reply_receipt",
+        ...response.result,
+        authority: "none",
+      };
+      return {
+        title: "Agent Bus reply receipt",
+        output: JSON.stringify(receipt),
+        metadata: {
+          type: receipt.type,
+          messageId: response.result.messageId,
+          replyToMessageId: response.result.replyToMessageId,
+          bodyHash: response.result.bodyHash,
+          bodyBytes: response.result.bodyBytes,
+          state: response.result.state,
+        },
+      };
+    } catch (error) {
+      throw asSafeModelError(error);
+    }
+  }
+
+  async receive(
+    context: AgentBusToolContext,
+    trustedForeground?: ForegroundSession,
+  ): Promise<ToolResult> {
+    try {
+      const generation = this.activeGeneration();
+      const { record, foreground } = await this.ensureForegroundRegistration(
+        context,
+        trustedForeground,
+      );
+      this.assertActive(generation);
+      let header: PendingMessageHeader | undefined;
+      let receiveObservation: number | undefined;
+      for (let attempt = 0; attempt < MAX_RECEIVE_OBSERVATION_ATTEMPTS; attempt += 1) {
+        const { headers: listedHeaders, observation } = await this.recoverPending(
+          record,
+          false,
+          generation,
+          true,
+          foreground,
+        );
+        const peekRequest = parseInput(PeekNextMessageRequestSchema, {
+          protocolVersion: PROTOCOL_VERSION,
+          requestId: this.nextRequestId(),
+          method: METHODS.PEEK_NEXT_MESSAGE,
+          params: { target: record.registration.identity, foreground },
+        });
+        const peekResponse = await this.requestAndParse(peekRequest, PeekNextMessageResponseSchema);
+        if (!peekResponse.ok) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+        const candidate = peekResponse.result.header;
+        if (
+          candidate !== null &&
+          !sameSessionIdentity(candidate.target, record.registration.identity)
+        ) {
+          throw this.invalidResponse();
+        }
+        const reconciledObservation = await this.reconcileReceiveObservation(
+          record,
+          listedHeaders,
+          candidate,
+          observation,
+        );
+        if (reconciledObservation === undefined) continue;
+        if (candidate === null) {
+          return {
+            title: "Agent Bus inbox",
+            output: JSON.stringify({ type: "agentbus_receive_status", state: "EMPTY" }),
+            metadata: { type: "agentbus_receive_status", state: "EMPTY" },
+          };
+        }
+        header = candidate;
+        receiveObservation = reconciledObservation;
+        break;
       }
-      if (!sameSessionIdentity(header.target, record.registration.identity)) {
-        throw this.invalidResponse();
+      if (!header || receiveObservation === undefined) {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
       }
-      const listedFirst = listedHeaders[0];
-      if (listedFirst && !samePendingHeader(listedFirst, header)) throw this.invalidResponse();
 
       const exactResource = receivePermissionResource(header.target, header.source);
       const permissionMetadata = ReceivePermissionMetadataSchema.parse({
@@ -332,6 +515,9 @@ export class AgentBusRuntime {
         throw new SafeModelError(SAFE_MODEL_ERRORS.RECEIVE_DENIED);
       }
       this.assertActive(generation);
+      if (!(await this.canConsumeReceiveObservation(record, header, receiveObservation))) {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+      }
 
       const consumeRequest = parseInput(ConsumeMessageRequestSchema, {
         protocolVersion: PROTOCOL_VERSION,
@@ -341,6 +527,7 @@ export class AgentBusRuntime {
           messageId: header.messageId,
           target: header.target,
           expectedBodyHash: header.bodyHash,
+          foreground,
         },
       });
       const consumeResponse = await this.requestAndParse(
@@ -349,6 +536,11 @@ export class AgentBusRuntime {
       );
       if (!consumeResponse.ok || !consumedResultMatchesHeader(header, consumeResponse.result)) {
         throw this.invalidResponse();
+      }
+      try {
+        await this.recoverPending(record, false, generation, false, foreground);
+      } catch {
+        if (this.isActive(generation)) this.schedulePrincipalCoverageRecovery();
       }
       const presentation = toPeerMessagePresentation(consumeResponse.result);
       return {
@@ -371,11 +563,18 @@ export class AgentBusRuntime {
     }
   }
 
-  async search(input: SearchInput, context: AgentBusToolContext): Promise<ToolResult> {
+  async search(
+    input: SearchInput,
+    context: AgentBusToolContext,
+    trustedForeground?: ForegroundSession,
+  ): Promise<ToolResult> {
     try {
       const generation = this.activeGeneration();
       const canonicalQuery = normalizeSearchQuery(input.query);
-      const record = await this.ensureRegistration(context.sessionID);
+      const { record, foreground } = await this.ensureForegroundRegistration(
+        context,
+        trustedForeground,
+      );
       this.assertActive(generation);
       const scope = record.registration.identity.broker;
       const exactResource = searchPermissionResource(scope, canonicalQuery);
@@ -398,12 +597,14 @@ export class AgentBusRuntime {
           scope,
           query: canonicalQuery,
           limit: input.limit ?? DEFAULT_SEARCH_LIMIT,
+          foreground,
         },
       });
       const response = await this.requestAndParse(request, SearchSessionsResponseSchema);
       if (!response.ok || !searchResultMatchesRequest(request, response.result)) {
         throw this.invalidResponse();
       }
+      await this.acceptForegroundRecovery(record, response, generation);
       for (const match of response.result.matches) {
         record.approvedTargets.set(match.session.sessionId, match.session);
         record.approvedTargets.set(match.fingerprint, match.session);
@@ -445,10 +646,12 @@ export class AgentBusRuntime {
     await this.enqueueSessionWork(parsedHostSessionId, async () => {
       const record = this.registrations.get(parsedHostSessionId);
       if (!record) return;
-      this.registrations.delete(parsedHostSessionId);
+      this.deleteRegistration(parsedHostSessionId);
       if (record.heartbeatTimer) this.scheduler.clear(record.heartbeatTimer);
       const channel = this.channel;
-      if (channel) await this.bestEffortDeregister(channel, record.registration.identity);
+      if (channel && record.active) {
+        await this.bestEffortDeregister(channel, record.registration.identity);
+      }
     });
   }
 
@@ -483,16 +686,21 @@ export class AgentBusRuntime {
     ]);
     if (channel) {
       await Promise.all(
-        initialRecords.map((record) =>
-          this.bestEffortDeregister(channel, record.registration.identity).catch(() => undefined),
-        ),
+        initialRecords
+          .filter((record) => record.active)
+          .map((record) =>
+            this.bestEffortDeregister(channel, record.registration.identity).catch(() => undefined),
+          ),
       );
       await channel.close().catch(() => undefined);
     }
     await Promise.all([...this.pendingChannels].map((item) => item.close().catch(() => undefined)));
     this.pendingChannels.clear();
     this.pendingStreams.clear();
-    this.registrations.clear();
+    this.authenticatedEventBuffer.clear();
+    this.eventBufferOverflowCursor = undefined;
+    this.bufferedEventRecoveryScheduled = false;
+    this.clearRegistrations();
   }
 
   private async attemptDesiredBootstrap(
@@ -521,14 +729,13 @@ export class AgentBusRuntime {
       }
     }
     this.assertActive(generation);
-    if (!deferEventRecovery && this.registrations.size > 0) {
+    if (!deferEventRecovery && this.hasActiveRegistrations()) {
       await this.recoverAllPendingResilient(true, generation);
       this.assertActive(generation);
       if (!this.channel) {
         this.scheduleBootstrapRetry();
         return;
       }
-      await this.startEventStream(undefined, generation);
     }
     if (this.hasPendingDesiredSessions()) this.scheduleBootstrapRetry();
   }
@@ -558,25 +765,119 @@ export class AgentBusRuntime {
     return false;
   }
 
-  private async ensureRegistration(hostSessionIdInput: string): Promise<RegistrationRecord> {
+  private async ensureForegroundRegistration(
+    context: TrustedForegroundToolContext,
+    trustedForeground?: ForegroundSession,
+  ): Promise<ForegroundRegistration> {
     const generation = this.activeGeneration();
-    const hostSessionId = parseInput(HostSessionIdSchema, hostSessionIdInput);
+    const hostSessionId = parseInput(HostSessionIdSchema, context.sessionID);
+    let foreground: ForegroundSession;
+    if (trustedForeground !== undefined) {
+      try {
+        foreground = ForegroundSessionSchema.parse(trustedForeground);
+      } catch {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+      }
+      if (foreground.hostSessionId !== hostSessionId) {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+      }
+    } else if (this.resolveForegroundSession) {
+      let trusted: ForegroundSession;
+      try {
+        trusted = await this.resolveForegroundSession({
+          sessionID: hostSessionId,
+          directory: context.directory,
+          worktree: context.worktree,
+        });
+      } catch {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+      }
+      if (trusted.hostSessionId !== hostSessionId) {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+      }
+      foreground = parseInput(ForegroundSessionSchema, trusted);
+    } else {
+      const known =
+        this.desiredSessions.get(hostSessionId)?.metadata ??
+        this.registrations.get(hostSessionId)?.registration.metadata;
+      if (!known && this.hostBootstrapCompleted) {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+      }
+      foreground = parseInput(ForegroundSessionSchema, {
+        hostSessionId,
+        metadata: known ?? SessionMetadataSchema.parse({}),
+      });
+    }
     await this.ensureConnection();
     this.assertActive(generation);
     const existing = this.registrations.get(hostSessionId);
-    if (existing) return existing;
-    const desired = this.desiredSessions.get(hostSessionId);
-    if (!desired && this.hostBootstrapCompleted) {
-      throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+    if (this.desiredSessions.has(hostSessionId)) {
+      this.setDesiredSession(hostSessionId, foreground.metadata);
     }
-    const registrationTarget =
-      desired ?? this.setDesiredSession(hostSessionId, SessionMetadataSchema.parse({}));
-    await this.enqueueSessionWork(hostSessionId, () =>
-      this.applyDesiredSession(hostSessionId, registrationTarget.version, false),
-    );
+    if (existing) {
+      existing.registration = { ...existing.registration, metadata: foreground.metadata };
+      return { record: existing, foreground };
+    }
+    await this.enqueueSessionWork(hostSessionId, async () => {
+      if (this.registrations.has(hostSessionId)) return;
+      await this.resolveForegroundIdentity(foreground, generation);
+    });
     const registered = this.registrations.get(hostSessionId);
     if (!registered) throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
-    return registered;
+    return { record: registered, foreground };
+  }
+
+  private async resolveForegroundIdentity(
+    foreground: ForegroundSession,
+    generation: number,
+  ): Promise<void> {
+    const channel = this.channel;
+    const snapshot = this.credential;
+    const brokerId = this.brokerId;
+    if (!channel || !snapshot || !brokerId) throw new SafeModelError(SAFE_MODEL_ERRORS.UNAVAILABLE);
+    const request = ForegroundIdentityRequestSchema.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: this.nextRequestId(),
+      method: METHODS.RESOLVE_FOREGROUND_SESSION,
+      params: foreground,
+    });
+    const response = await this.requestAndParse(
+      request,
+      ForegroundIdentityResponseSchema,
+      generation,
+    );
+    if (!response.ok) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+    const previous = this.registrations.get(foreground.hostSessionId);
+    if (
+      response.result.hostSessionId !== foreground.hostSessionId ||
+      response.result.identity.broker.brokerId !== brokerId ||
+      response.result.identity.broker.serverId !== snapshot.credential.serverId ||
+      response.result.fingerprint !== sessionFingerprint(response.result.identity) ||
+      !sameMetadata(response.result.metadata, foreground.metadata) ||
+      (previous && !sameSessionIdentity(previous.registration.identity, response.result.identity))
+    ) {
+      throw this.invalidResponse();
+    }
+    const record: RegistrationRecord = {
+      hostSessionId: foreground.hostSessionId,
+      registration: response.result,
+      binding: {
+        ownerPrincipalId: snapshot.credential.principalId,
+        hostSessionId: foreground.hostSessionId,
+        identity: response.result.identity,
+      } as PrincipalSessionBinding,
+      active: false,
+      recovered: false,
+      approvedTargets: previous?.approvedTargets ?? new Map(),
+      pendingCount: previous?.pendingCount ?? 0,
+      pendingObservationIssued: previous?.pendingObservationIssued ?? 0,
+      pendingObservationApplied: previous?.pendingObservationApplied ?? 0,
+      pendingFirstHeader: previous?.pendingFirstHeader,
+      ...(previous?.pendingEventCursor === undefined
+        ? {}
+        : { pendingEventCursor: previous.pendingEventCursor }),
+    };
+    this.setRegistration(foreground.hostSessionId, record);
   }
 
   private ensureConnection(deferEventRecovery = false): Promise<void> {
@@ -620,9 +921,13 @@ export class AgentBusRuntime {
     for (const record of previousRegistrations.values()) {
       if (record.heartbeatTimer) this.scheduler.clear(record.heartbeatTimer);
     }
-    this.registrations.clear();
+    this.clearRegistrations();
     const previousStream = this.eventStream;
     const previousChannel = this.channel;
+    if (previousStream && this.streamCoverage?.stream === previousStream) {
+      this.resumePoint = { cursor: this.streamCoverage.through, stale: false };
+    }
+    this.streamCoverage = undefined;
     this.eventStream = undefined;
     this.channel = undefined;
     await previousStream?.close().catch(() => undefined);
@@ -693,13 +998,12 @@ export class AgentBusRuntime {
           await this.bestEffortDeregister(channel, record.registration.identity);
           continue;
         }
-        this.registrations.set(hostSessionId, record);
-        this.scheduleHeartbeat(record);
+        this.setRegistration(hostSessionId, record);
+        if (record.active) this.scheduleHeartbeat(record);
       }
-      if (!deferEventRecovery && this.registrations.size > 0) {
+      if (!deferEventRecovery && this.hasActiveRegistrations()) {
         await this.recoverAllPendingResilient(true, generation);
         this.assertConnectionActive(generation, attempt);
-        await this.startEventStream(undefined, generation);
       }
       if (this.hasPendingDesiredSessions()) this.scheduleBootstrapRetry();
       this.pendingChannels.delete(channel);
@@ -757,11 +1061,9 @@ export class AgentBusRuntime {
       request,
     });
     if (
-      !registrationResultMatchesInput(
-        authenticatedInput,
-        response.result,
-        previousRecord?.registration,
-      )
+      !registrationResultMatchesInput(authenticatedInput, response.result) ||
+      (previousRecord &&
+        !sameSessionIdentity(previousRecord.registration.identity, response.result.identity))
     ) {
       throw this.invalidResponse();
     }
@@ -774,8 +1076,16 @@ export class AgentBusRuntime {
       hostSessionId,
       registration: response.result,
       binding,
+      active: response.result.registration !== "deferred",
+      recovered: false,
       approvedTargets: previousRecord?.approvedTargets ?? new Map(),
       pendingCount: previousRecord?.pendingCount ?? 0,
+      pendingObservationIssued: previousRecord?.pendingObservationIssued ?? 0,
+      pendingObservationApplied: previousRecord?.pendingObservationApplied ?? 0,
+      pendingFirstHeader: previousRecord?.pendingFirstHeader,
+      ...(previousRecord?.pendingEventCursor === undefined
+        ? {}
+        : { pendingEventCursor: previousRecord.pendingEventCursor }),
     };
     return record;
   }
@@ -796,7 +1106,6 @@ export class AgentBusRuntime {
     if (existing && sameMetadata(existing.registration.metadata, currentDesired.metadata)) {
       if (!deferEvents && !this.eventStream) {
         await this.recoverAllPending(true, generation);
-        await this.startEventStream(undefined, generation);
       }
       return;
     }
@@ -823,14 +1132,13 @@ export class AgentBusRuntime {
       await this.bestEffortDeregister(channel, record.registration.identity);
       return;
     }
-    this.registrations.set(hostSessionId, record);
-    this.scheduleHeartbeat(record);
-    if (!deferEvents) {
+    this.setRegistration(hostSessionId, record);
+    if (record.active) this.scheduleHeartbeat(record);
+    if (!deferEvents && record.active) {
       if (this.eventStream) {
         await this.recoverPending(record, true, generation);
       } else {
         await this.recoverAllPending(true, generation);
-        await this.startEventStream(undefined, generation);
       }
     }
   }
@@ -839,12 +1147,39 @@ export class AgentBusRuntime {
     record: RegistrationRecord,
     notify: boolean,
     generation = this.activeGeneration(),
-  ): Promise<readonly PendingMessageHeader[]> {
+    deferEmpty = false,
+    foreground?: ForegroundSession,
+  ): Promise<PendingRecoveryResult> {
+    return this.enqueuePendingRecovery(async () => {
+      const observation = this.nextPendingObservation(record);
+      const recovery = await this.fetchPendingRecovery(record, generation, foreground);
+      this.activateRegistration(record);
+      const headers = await this.performPendingConvergence(
+        record,
+        recovery,
+        notify,
+        generation,
+        observation,
+        deferEmpty,
+      );
+      return { headers, observation };
+    });
+  }
+
+  private async fetchPendingRecovery(
+    record: RegistrationRecord,
+    generation: number,
+    foreground?: ForegroundSession,
+  ): Promise<ForegroundPendingRecovery> {
     const request = ListPendingMessagesRequestSchema.parse({
       protocolVersion: PROTOCOL_VERSION,
       requestId: this.nextRequestId(),
       method: METHODS.LIST_PENDING_MESSAGES,
-      params: { target: record.registration.identity, limit: DEFAULT_PENDING_LIST_LIMIT },
+      params: {
+        target: record.registration.identity,
+        limit: DEFAULT_PENDING_LIST_LIMIT,
+        ...(foreground === undefined ? {} : { foreground }),
+      },
     });
     const response = await this.requestAndParse(
       request,
@@ -854,75 +1189,745 @@ export class AgentBusRuntime {
     if (!response.ok || !listPendingResultMatchesRequest(request, response.result)) {
       throw this.invalidResponse();
     }
-    record.pendingCount = response.result.headers.length;
-    if (notify && this.totalPending() > 0) {
-      await this.notifyPending(this.totalPending()).catch(() => undefined);
-      this.assertActive(generation);
+    return response.result;
+  }
+
+  private async acceptForegroundRecovery(
+    record: RegistrationRecord,
+    response: object,
+    generation: number,
+  ): Promise<void> {
+    const recovery =
+      "foregroundRecovery" in response
+        ? (response.foregroundRecovery as ForegroundPendingRecovery)
+        : undefined;
+    if (!recovery || !sameSessionIdentity(recovery.target, record.registration.identity)) {
+      throw this.invalidResponse();
     }
-    return response.result.headers;
+    this.activateRegistration(record);
+    await this.convergePendingRecovery(record, recovery, true, generation, false);
+  }
+
+  private convergePendingRecovery(
+    record: RegistrationRecord,
+    initialRecovery: ForegroundPendingRecovery,
+    notify: boolean,
+    generation: number,
+    deferEmpty: boolean,
+  ): Promise<readonly PendingMessageHeader[]> {
+    return this.enqueuePendingRecovery(() =>
+      this.performPendingConvergence(
+        record,
+        initialRecovery,
+        notify,
+        generation,
+        this.nextPendingObservation(record),
+        deferEmpty,
+      ),
+    );
+  }
+
+  private enqueuePendingRecovery<T>(operation: () => Promise<T>): Promise<T> {
+    const work = this.pendingRecoveryWork.then(async () => {
+      if (this.pendingRecoveryLaneActive) {
+        throw new Error("Pending recovery lane re-entry is forbidden.");
+      }
+      this.pendingRecoveryLaneActive = true;
+      try {
+        return await operation();
+      } finally {
+        this.pendingRecoveryLaneActive = false;
+      }
+    });
+    this.pendingRecoveryWork = work.then(
+      () => undefined,
+      () => undefined,
+    );
+    return work;
+  }
+
+  private reconcileReceiveObservation(
+    record: RegistrationRecord,
+    listedHeaders: readonly PendingMessageHeader[],
+    candidate: PendingMessageHeader | null,
+    observation: number,
+  ): Promise<number | undefined> {
+    return this.enqueuePendingRecovery(async () => {
+      await this.eventWork;
+      if (this.hasUncoveredAuthenticatedEvent(record)) return undefined;
+      if (!this.isPendingObservationCurrent(record, observation)) {
+        return this.pendingSnapshotMatchesCandidate(record, candidate)
+          ? record.pendingObservationApplied
+          : undefined;
+      }
+      if (candidate !== null) {
+        const listedFirst = listedHeaders[0];
+        if (listedFirst && !samePendingHeader(listedFirst, candidate)) {
+          throw this.invalidResponse();
+        }
+      }
+      return this.applyPendingObservation(
+        record,
+        candidate === null ? 0 : Math.max(1, listedHeaders.length),
+        observation,
+        true,
+        candidate ?? undefined,
+      )
+        ? observation
+        : undefined;
+    });
+  }
+
+  private canConsumeReceiveObservation(
+    record: RegistrationRecord,
+    header: PendingMessageHeader,
+    observation: number,
+  ): Promise<boolean> {
+    return this.enqueuePendingRecovery(async () => {
+      await this.eventWork;
+      if (this.hasUncoveredAuthenticatedEvent(record)) return false;
+      return (
+        this.isPendingObservationCurrent(record, observation) ||
+        this.pendingSnapshotMatchesCandidate(record, header)
+      );
+    });
+  }
+
+  private pendingSnapshotMatchesCandidate(
+    record: RegistrationRecord,
+    candidate: PendingMessageHeader | null,
+  ): boolean {
+    if (candidate === null) {
+      return record.pendingCount === 0 && record.pendingFirstHeader === undefined;
+    }
+    return (
+      record.pendingCount > 0 &&
+      record.pendingFirstHeader !== undefined &&
+      samePendingHeader(record.pendingFirstHeader, candidate)
+    );
+  }
+
+  private async performPendingConvergence(
+    record: RegistrationRecord,
+    initialRecovery: ForegroundPendingRecovery,
+    notify: boolean,
+    generation: number,
+    observation: number,
+    deferEmpty: boolean,
+  ): Promise<readonly PendingMessageHeader[]> {
+    this.assertActive(generation);
+    this.activateRegistration(record);
+    let recovery = initialRecovery;
+    for (let attempt = 0; attempt < MAX_PRINCIPAL_CONVERGENCE_ATTEMPTS; attempt += 1) {
+      await this.eventWork;
+      this.assertActive(generation);
+      if (!this.isPrincipalStreamCovered()) {
+        let recovered: Map<string, ForegroundPendingRecovery>;
+        try {
+          recovered = await this.performPrincipalCoverage(generation, notify, recovery, {
+            record,
+            observation,
+            deferEmpty,
+          });
+        } catch (error) {
+          this.schedulePrincipalCoverageRecovery();
+          throw error;
+        }
+        const result = recovered.get(record.hostSessionId);
+        if (!result) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+        return result.headers;
+      }
+
+      if (this.recoveryHasCursorGap(record, recovery)) {
+        recovery = await this.fetchPendingRecovery(record, generation);
+        continue;
+      }
+
+      const previousCount = record.pendingCount;
+      let applied = false;
+      if (recovery.headers.length > 0 || !deferEmpty) {
+        if (
+          !this.applyPendingObservation(
+            record,
+            recovery.headers.length,
+            observation,
+            false,
+            recovery.headers[0],
+          )
+        ) {
+          throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+        }
+        applied = true;
+      } else if (!this.commitPendingObservation(record, observation)) {
+        throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+      }
+      this.setPendingEventCursor(record, recovery.eventCursor);
+      record.recovered = true;
+      this.pruneAuthenticatedEvents(record, recovery.eventCursor);
+      this.scheduleHeartbeat(record);
+      if (applied && previousCount !== record.pendingCount) {
+        this.publishPendingState(record);
+        if (notify && this.totalPending() > 0) {
+          if (record.pendingCount > 0) {
+            await this.notifyPendingForSession(record.hostSessionId, record.pendingCount).catch(
+              () => undefined,
+            );
+          }
+          await this.notifyPending(this.totalPending()).catch(() => undefined);
+          this.assertActive(generation);
+        }
+      }
+      return recovery.headers;
+    }
+    throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+  }
+
+  private async performPrincipalCoverage(
+    generation: number,
+    notify: boolean,
+    seedRecovery?: ForegroundPendingRecovery,
+    override?: PendingRecoveryOverride,
+  ): Promise<Map<string, ForegroundPendingRecovery>> {
+    this.assertActive(generation);
+    if (this.isPrincipalStreamCovered() && this.eventBufferOverflowCursor === undefined) {
+      return new Map();
+    }
+
+    let connected = this.eventStream !== undefined;
+    let candidateCursor =
+      this.resumePoint?.stale === false ? this.resumePoint.cursor : seedRecovery?.eventCursor;
+    for (let attempt = 0; !connected && attempt < 3; attempt += 1) {
+      const seedRecord =
+        override?.record ?? [...this.registrations.values()].find((candidate) => candidate.active);
+      if (!seedRecord) return new Map();
+      if (candidateCursor === undefined) {
+        candidateCursor = (await this.fetchPendingRecovery(seedRecord, generation)).eventCursor;
+      }
+      connected = await this.startEventStream(candidateCursor, generation, true);
+      if (connected) break;
+      this.resumePoint = undefined;
+      candidateCursor = (await this.fetchPendingRecovery(seedRecord, generation)).eventCursor;
+    }
+
+    for (let attempt = 0; attempt < MAX_PRINCIPAL_CONVERGENCE_ATTEMPTS; attempt += 1) {
+      await this.eventWork;
+      this.assertActive(generation);
+      const membershipVersion = this.registrationMembershipVersion;
+      const activeRecords = [...this.registrations.values()].filter(
+        (candidate) => candidate.active,
+      );
+      const entries: PendingRecoveryEntry[] = [];
+      for (const activeRecord of activeRecords) {
+        const matchingOverride = override?.record === activeRecord ? override : undefined;
+        entries.push({
+          record: activeRecord,
+          recovery: await this.fetchPendingRecovery(activeRecord, generation),
+          observation: matchingOverride?.observation ?? this.nextPendingObservation(activeRecord),
+          deferEmpty: matchingOverride?.deferEmpty ?? false,
+        });
+      }
+      await this.eventWork;
+      this.assertActive(generation);
+
+      const membershipStable =
+        membershipVersion === this.registrationMembershipVersion &&
+        entries.every(
+          ({ record }) => record.active && this.registrations.get(record.hostSessionId) === record,
+        );
+      const hasNewerTargetEvent = entries.some(({ record, recovery }) =>
+        this.recoveryHasCursorGap(record, recovery),
+      );
+      const overflowCovered =
+        this.eventBufferOverflowCursor === undefined ||
+        entries.every(
+          ({ recovery }) =>
+            compareEventCursors(
+              recovery.eventCursor,
+              this.eventBufferOverflowCursor as EventCursor,
+            ) >= 0,
+        );
+      if (!membershipStable || hasNewerTargetEvent || !overflowCovered) {
+        if (attempt === MAX_PRINCIPAL_CONVERGENCE_ATTEMPTS - 1) {
+          throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+        }
+        continue;
+      }
+      for (const entry of entries) {
+        if (!this.canApplyPendingObservation(entry.record, entry.observation)) {
+          throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+        }
+      }
+
+      const changedRecords: RegistrationRecord[] = [];
+      const recovered = new Map<string, ForegroundPendingRecovery>();
+      let coveredThrough = candidateCursor ?? EventCursorSchema.parse("0");
+      for (const entry of entries) {
+        const previousCount = entry.record.pendingCount;
+        if (entry.recovery.headers.length > 0 || !entry.deferEmpty) {
+          this.applyPendingObservation(
+            entry.record,
+            entry.recovery.headers.length,
+            entry.observation,
+            false,
+            entry.recovery.headers[0],
+          );
+        } else {
+          this.commitPendingObservation(entry.record, entry.observation);
+        }
+        this.setPendingEventCursor(entry.record, entry.recovery.eventCursor);
+        entry.record.recovered = true;
+        this.pruneAuthenticatedEvents(entry.record, entry.recovery.eventCursor);
+        this.scheduleHeartbeat(entry.record);
+        if (previousCount !== entry.record.pendingCount) changedRecords.push(entry.record);
+        if (compareEventCursors(entry.recovery.eventCursor, coveredThrough) < 0) {
+          coveredThrough = entry.recovery.eventCursor;
+        }
+        recovered.set(entry.record.hostSessionId, entry.recovery);
+      }
+      if (overflowCovered) this.eventBufferOverflowCursor = undefined;
+      this.pruneMissingRegistrationEvents();
+
+      const stream = this.eventStream;
+      this.resumePoint = { cursor: coveredThrough, stale: false };
+      if (stream && connected) {
+        this.streamCoverage = {
+          stream,
+          membershipVersion,
+          through: coveredThrough,
+        };
+      } else {
+        this.streamCoverage = undefined;
+        this.scheduleEventReconnect({
+          lastEventId: coveredThrough,
+          staleCursor: false,
+          requiresRecovery: true,
+        });
+      }
+      for (const changedRecord of changedRecords) this.publishPendingState(changedRecord);
+      if (notify && this.totalPending() > 0) {
+        for (const changedRecord of changedRecords) {
+          if (changedRecord.pendingCount <= 0) continue;
+          await this.notifyPendingForSession(
+            changedRecord.hostSessionId,
+            changedRecord.pendingCount,
+          ).catch(() => undefined);
+        }
+        await this.notifyPending(this.totalPending()).catch(() => undefined);
+        this.assertActive(generation);
+      }
+      return recovered;
+    }
+    throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
   }
 
   private async recoverAllPending(
     notify: boolean,
     generation = this.activeGeneration(),
   ): Promise<void> {
-    for (const record of this.registrations.values()) {
-      await this.recoverPending(record, false, generation);
-      this.assertActive(generation);
-    }
-    if (notify && this.totalPending() > 0) {
-      await this.notifyPending(this.totalPending()).catch(() => undefined);
-      this.assertActive(generation);
-    }
+    await this.enqueuePendingRecovery(async () => {
+      if (!this.isPrincipalStreamCovered() || this.eventBufferOverflowCursor !== undefined) {
+        await this.performPrincipalCoverage(generation, notify);
+      }
+      if (this.hasUncoveredAuthenticatedEvents()) {
+        await this.performBufferedEventRecovery(generation, notify);
+      }
+    });
   }
 
   private async recoverAllPendingResilient(notify: boolean, generation: number): Promise<void> {
-    for (const record of [...this.registrations.values()]) {
-      try {
-        await this.recoverPending(record, false, generation);
-      } catch (error) {
-        if (!this.isActive(generation)) throw error;
+    try {
+      await this.recoverAllPending(notify, generation);
+    } catch (error) {
+      if (!this.isActive(generation)) throw error;
+      this.schedulePrincipalCoverageRecovery();
+    }
+  }
+
+  private async performBufferedEventRecovery(generation: number, notify: boolean): Promise<void> {
+    this.assertActive(generation);
+    for (let attempt = 0; attempt < MAX_PRINCIPAL_CONVERGENCE_ATTEMPTS; attempt += 1) {
+      await this.eventWork;
+      this.assertActive(generation);
+      this.pruneMissingRegistrationEvents();
+      if (!this.hasUncoveredAuthenticatedEvents()) return;
+      if (!this.isPrincipalStreamCovered() || this.eventBufferOverflowCursor !== undefined) {
+        await this.performPrincipalCoverage(generation, notify);
+        if (!this.hasUncoveredAuthenticatedEvents()) return;
+        continue;
+      }
+
+      const membershipVersion = this.registrationMembershipVersion;
+      const coverage = this.streamCoverage;
+      const records = this.activeRecordsWithUncoveredEvents();
+      const entries: PendingRecoveryEntry[] = [];
+      for (const record of records) {
+        entries.push({
+          record,
+          recovery: await this.fetchPendingRecovery(record, generation),
+          observation: this.nextPendingObservation(record),
+          deferEmpty: false,
+        });
+      }
+      await this.eventWork;
+      this.assertActive(generation);
+
+      const membershipStable =
+        membershipVersion === this.registrationMembershipVersion &&
+        coverage === this.streamCoverage &&
+        this.isPrincipalStreamCovered() &&
+        entries.every(
+          ({ record }) => record.active && this.registrations.get(record.hostSessionId) === record,
+        );
+      const entryByRecord = new Map(entries.map((entry) => [entry.record, entry]));
+      const allBufferedTargetsCovered = this.activeRecordsWithUncoveredEvents().every((record) => {
+        const entry = entryByRecord.get(record);
+        return entry !== undefined && !this.recoveryHasCursorGap(record, entry.recovery);
+      });
+      if (!membershipStable || !allBufferedTargetsCovered) {
+        if (attempt === MAX_PRINCIPAL_CONVERGENCE_ATTEMPTS - 1) {
+          throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+        }
+        continue;
+      }
+      for (const entry of entries) {
+        if (!this.canApplyPendingObservation(entry.record, entry.observation)) {
+          throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+        }
+      }
+
+      const changedRecords: RegistrationRecord[] = [];
+      for (const entry of entries) {
+        const previousCount = entry.record.pendingCount;
+        this.applyPendingObservation(
+          entry.record,
+          entry.recovery.headers.length,
+          entry.observation,
+          false,
+          entry.recovery.headers[0],
+        );
+        this.setPendingEventCursor(entry.record, entry.recovery.eventCursor);
+        entry.record.recovered = true;
+        this.pruneAuthenticatedEvents(entry.record, entry.recovery.eventCursor);
+        this.scheduleHeartbeat(entry.record);
+        if (previousCount !== entry.record.pendingCount) changedRecords.push(entry.record);
+      }
+      for (const changedRecord of changedRecords) this.publishPendingState(changedRecord);
+      if (notify && changedRecords.length > 0 && this.totalPending() > 0) {
+        for (const changedRecord of changedRecords) {
+          if (changedRecord.pendingCount <= 0) continue;
+          await this.notifyPendingForSession(
+            changedRecord.hostSessionId,
+            changedRecord.pendingCount,
+          ).catch(() => undefined);
+        }
+        await this.notifyPending(this.totalPending()).catch(() => undefined);
+        this.assertActive(generation);
+      }
+      if (!this.hasUncoveredAuthenticatedEvents()) return;
+    }
+    throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+  }
+
+  private recoveryHasCursorGap(
+    record: RegistrationRecord,
+    recovery: ForegroundPendingRecovery,
+  ): boolean {
+    if (
+      record.pendingEventCursor !== undefined &&
+      compareEventCursors(record.pendingEventCursor, recovery.eventCursor) > 0
+    ) {
+      return true;
+    }
+    for (const event of this.authenticatedEventBuffer.values()) {
+      if (
+        sameSessionIdentity(event.target, record.registration.identity) &&
+        compareEventCursors(event.eventId, recovery.eventCursor) > 0
+      ) {
+        return true;
       }
     }
-    if (notify && this.totalPending() > 0) {
-      await this.notifyPending(this.totalPending()).catch(() => undefined);
-      this.assertActive(generation);
+    return false;
+  }
+
+  private activeRecordsWithUncoveredEvents(): RegistrationRecord[] {
+    const records = new Set<RegistrationRecord>();
+    for (const event of this.authenticatedEventBuffer.values()) {
+      const record = [...this.registrations.values()].find(
+        (candidate) =>
+          candidate.active && sameSessionIdentity(candidate.registration.identity, event.target),
+      );
+      if (
+        record &&
+        (record.pendingEventCursor === undefined ||
+          compareEventCursors(event.eventId, record.pendingEventCursor) > 0)
+      ) {
+        records.add(record);
+      }
     }
+    return [...records];
+  }
+
+  private hasUncoveredAuthenticatedEvent(record: RegistrationRecord): boolean {
+    for (const event of this.authenticatedEventBuffer.values()) {
+      if (
+        sameSessionIdentity(event.target, record.registration.identity) &&
+        (record.pendingEventCursor === undefined ||
+          compareEventCursors(event.eventId, record.pendingEventCursor) > 0)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private hasUncoveredAuthenticatedEvents(): boolean {
+    return (
+      (this.eventBufferOverflowCursor !== undefined && this.hasActiveRegistrations()) ||
+      this.activeRecordsWithUncoveredEvents().length > 0
+    );
+  }
+
+  private pruneAuthenticatedEvents(record: RegistrationRecord, cursor: EventCursor): void {
+    for (const [eventId, event] of this.authenticatedEventBuffer) {
+      if (
+        sameSessionIdentity(event.target, record.registration.identity) &&
+        compareEventCursors(event.eventId, cursor) <= 0
+      ) {
+        this.authenticatedEventBuffer.delete(eventId);
+      }
+    }
+  }
+
+  private dropAuthenticatedEvents(record: RegistrationRecord): void {
+    for (const [eventId, event] of this.authenticatedEventBuffer) {
+      if (sameSessionIdentity(event.target, record.registration.identity)) {
+        this.authenticatedEventBuffer.delete(eventId);
+      }
+    }
+  }
+
+  private pruneMissingRegistrationEvents(): void {
+    for (const [eventId, event] of this.authenticatedEventBuffer) {
+      const retained = [...this.registrations.values()].some((record) =>
+        sameSessionIdentity(record.registration.identity, event.target),
+      );
+      if (!retained) this.authenticatedEventBuffer.delete(eventId);
+    }
+  }
+
+  private scheduleBufferedEventRecovery(): void {
+    if (this.disposed || this.bufferedEventRecoveryScheduled) return;
+    const generation = this.lifecycleGeneration;
+    this.bufferedEventRecoveryScheduled = true;
+    const work = this.enqueuePendingRecovery(() =>
+      this.performBufferedEventRecovery(generation, true),
+    );
+    void work.then(
+      () => {
+        this.bufferedEventRecoveryScheduled = false;
+        if (this.isActive(generation) && this.hasUncoveredAuthenticatedEvents()) {
+          this.scheduleBufferedEventRecovery();
+        }
+      },
+      () => {
+        this.bufferedEventRecoveryScheduled = false;
+        if (this.isActive(generation) && this.hasUncoveredAuthenticatedEvents()) {
+          this.schedulePrincipalCoverageRecovery();
+        }
+      },
+    );
   }
 
   private totalPending(): number {
     let count = 0;
-    for (const record of this.registrations.values()) count += record.pendingCount;
+    for (const record of this.registrations.values()) {
+      if (record.active) count += record.pendingCount;
+    }
     return count;
+  }
+
+  private advanceRegistrationMembership(): void {
+    this.registrationMembershipVersion += 1;
+  }
+
+  private setRegistration(hostSessionId: string, record: RegistrationRecord): void {
+    const previous = this.registrations.get(hostSessionId);
+    this.registrations.set(hostSessionId, record);
+    if (!record.active) {
+      this.dropAuthenticatedEvents(record);
+      if (previous?.active || record.pendingCount !== 0) {
+        this.scheduleInactivePendingClear(record);
+      }
+    }
+    if (previous?.active || record.active) this.advanceRegistrationMembership();
+  }
+
+  private scheduleInactivePendingClear(record: RegistrationRecord): void {
+    const work = this.enqueuePendingRecovery(async () => {
+      if (this.registrations.get(record.hostSessionId) !== record || record.active) return;
+      const previousCount = record.pendingCount;
+      const observation = this.nextPendingObservation(record);
+      this.applyPendingObservation(record, 0, observation, false);
+      record.recovered = false;
+      if (previousCount !== 0) this.publishPendingState(record);
+    });
+    void work.catch(() => undefined);
+  }
+
+  private deleteRegistration(hostSessionId: string): void {
+    const previous = this.registrations.get(hostSessionId);
+    if (!previous) return;
+    this.registrations.delete(hostSessionId);
+    if (previous.active) this.advanceRegistrationMembership();
+  }
+
+  private clearRegistrations(): void {
+    const hadActive = this.hasActiveRegistrations();
+    this.registrations.clear();
+    if (hadActive) this.advanceRegistrationMembership();
+  }
+
+  private activateRegistration(record: RegistrationRecord): void {
+    if (record.active) return;
+    record.active = true;
+    this.advanceRegistrationMembership();
+  }
+
+  private isPrincipalStreamCovered(): boolean {
+    return (
+      this.eventStream !== undefined &&
+      this.streamCoverage?.stream === this.eventStream &&
+      this.streamCoverage.membershipVersion === this.registrationMembershipVersion
+    );
+  }
+
+  private schedulePrincipalCoverageRecovery(): void {
+    if (!this.hasActiveRegistrations()) return;
+    this.scheduleEventReconnect({
+      ...(this.resumePoint?.cursor === undefined ? {} : { lastEventId: this.resumePoint.cursor }),
+      staleCursor: this.resumePoint?.stale ?? false,
+      requiresRecovery: true,
+    });
+  }
+
+  private hasActiveRegistrations(): boolean {
+    return [...this.registrations.values()].some((record) => record.active);
+  }
+
+  private publishPendingState(record: RegistrationRecord): void {
+    this.assertPendingRecoveryLane();
+    try {
+      this.updatePending(record.hostSessionId, record.pendingCount);
+    } catch {
+      // Host wake coordination is best-effort and must not affect broker state or tool results.
+    }
+  }
+
+  private nextPendingObservation(record: RegistrationRecord): number {
+    record.pendingObservationIssued += 1;
+    return record.pendingObservationIssued;
+  }
+
+  private applyPendingObservation(
+    record: RegistrationRecord,
+    count: number,
+    observation: number,
+    publish = true,
+    firstHeader?: PendingMessageHeader,
+  ): boolean {
+    this.assertPendingRecoveryLane();
+    if (!this.canApplyPendingObservation(record, observation)) return false;
+    const previousCount = record.pendingCount;
+    record.pendingObservationApplied = observation;
+    record.pendingCount = count;
+    record.pendingFirstHeader = count === 0 ? undefined : firstHeader;
+    if (publish && previousCount !== count) this.publishPendingState(record);
+    return true;
+  }
+
+  private commitPendingObservation(record: RegistrationRecord, observation: number): boolean {
+    this.assertPendingRecoveryLane();
+    if (!this.canApplyPendingObservation(record, observation)) return false;
+    record.pendingObservationApplied = observation;
+    return true;
+  }
+
+  private setPendingEventCursor(record: RegistrationRecord, cursor: EventCursor): void {
+    this.assertPendingRecoveryLane();
+    record.pendingEventCursor = cursor;
+  }
+
+  private assertPendingRecoveryLane(): void {
+    if (!this.pendingRecoveryLaneActive) {
+      throw new Error("Pending state mutation requires the recovery lane.");
+    }
+  }
+
+  private canApplyPendingObservation(record: RegistrationRecord, observation: number): boolean {
+    return (
+      this.registrations.get(record.hostSessionId) === record &&
+      observation >= record.pendingObservationApplied
+    );
+  }
+
+  private isPendingObservationCurrent(record: RegistrationRecord, observation: number): boolean {
+    return (
+      this.registrations.get(record.hostSessionId) === record &&
+      observation === record.pendingObservationApplied
+    );
   }
 
   private async startEventStream(
     lastEventId?: string,
     generation = this.activeGeneration(),
-  ): Promise<void> {
+    suppressReconnect = false,
+  ): Promise<boolean> {
     this.assertActive(generation);
-    if (this.eventStream || !this.credential || this.registrations.size === 0) return;
+    if (this.eventStream) return true;
+    if (lastEventId === undefined || !this.credential || !this.hasActiveRegistrations()) {
+      return false;
+    }
     const stream = this.eventStreamFactory({
       config: this.config,
       credential: this.credential.credential,
     });
     this.pendingStreams.add(stream);
     this.eventStream = stream;
+    let disconnected = false;
+    let reconnectSuppressed = suppressReconnect;
     try {
       await stream.start({
-        ...(lastEventId === undefined ? {} : { lastEventId }),
+        lastEventId,
         onEvent: async (event) => {
           if (!this.isActive(generation)) return;
-          this.eventWork = this.eventWork.then(() => this.handlePendingEvent(event, generation));
+          this.eventWork = this.eventWork.then(() => this.ingestPendingEvent(event, generation));
           await this.eventWork;
         },
         onDisconnect: (disconnect) => {
           if (!this.isActive(generation) || this.eventStream !== stream) return;
+          disconnected = true;
+          const parsedCursor =
+            disconnect.lastEventId === undefined
+              ? undefined
+              : EventCursorSchema.safeParse(disconnect.lastEventId);
+          const coveredCursor =
+            this.streamCoverage?.stream === stream ? this.streamCoverage.through : undefined;
+          this.resumePoint = {
+            ...(parsedCursor?.success
+              ? { cursor: parsedCursor.data }
+              : coveredCursor === undefined
+                ? {}
+                : { cursor: coveredCursor }),
+            stale: disconnect.staleCursor || disconnect.requiresRecovery === true,
+          };
+          this.streamCoverage = undefined;
           this.eventStream = undefined;
-          this.scheduleEventReconnect(disconnect);
+          if (!reconnectSuppressed) this.scheduleEventReconnect(disconnect);
         },
       });
+      reconnectSuppressed = false;
       this.assertActive(generation);
+      return !disconnected && this.eventStream === stream;
     } catch (error) {
       if (this.eventStream === stream) this.eventStream = undefined;
       await stream.close().catch(() => undefined);
@@ -932,10 +1937,10 @@ export class AgentBusRuntime {
     }
   }
 
-  private async handlePendingEvent(
+  private ingestPendingEvent(
     candidate: PendingMessageEvent,
     generation = this.activeGeneration(),
-  ): Promise<void> {
+  ): void {
     if (!this.isActive(generation)) return;
     const parsed = PendingMessageEventSchema.safeParse(candidate);
     if (!parsed.success || !this.credential) return;
@@ -948,8 +1953,26 @@ export class AgentBusRuntime {
     const record = [...this.registrations.values()].find((item) =>
       sameSessionIdentity(item.registration.identity, parsed.data.target),
     );
-    if (!record) return;
-    await this.recoverPending(record, true, generation).catch(() => undefined);
+    if (!record || !record.active) return;
+    if (
+      record.pendingEventCursor !== undefined &&
+      compareEventCursors(parsed.data.eventId, record.pendingEventCursor) <= 0
+    ) {
+      return;
+    }
+    if (this.authenticatedEventBuffer.has(parsed.data.eventId)) return;
+    if (this.authenticatedEventBuffer.size >= MAX_EVENT_REPLAY_WINDOW) {
+      if (
+        this.eventBufferOverflowCursor === undefined ||
+        compareEventCursors(parsed.data.eventId, this.eventBufferOverflowCursor) > 0
+      ) {
+        this.eventBufferOverflowCursor = EventCursorSchema.parse(parsed.data.eventId);
+      }
+      this.scheduleBufferedEventRecovery();
+      return;
+    }
+    this.authenticatedEventBuffer.set(parsed.data.eventId, parsed.data);
+    this.scheduleBufferedEventRecovery();
   }
 
   private scheduleEventReconnect(disconnect: EventStreamDisconnect): void {
@@ -966,17 +1989,8 @@ export class AgentBusRuntime {
       const generation = this.activeGeneration();
       await this.ensureConnection();
       this.assertActive(generation);
-      if (this.eventStream) return;
-      if (
-        disconnect.staleCursor ||
-        disconnect.requiresRecovery === true ||
-        disconnect.lastEventId === undefined
-      ) {
-        await this.recoverAllPending(true, generation);
-        await this.startEventStream(undefined, generation);
-      } else {
-        await this.startEventStream(disconnect.lastEventId, generation);
-      }
+      if (this.isPrincipalStreamCovered() && !this.hasUncoveredAuthenticatedEvents()) return;
+      await this.recoverAllPending(true, generation);
     } catch {
       this.scheduleEventReconnect(disconnect);
     }
@@ -986,14 +2000,23 @@ export class AgentBusRuntime {
     this.connectionAttempt += 1;
     const channel = this.channel;
     const stream = this.eventStream;
+    const coverage = this.streamCoverage;
+    const coveredCursor =
+      coverage !== undefined && coverage.stream === stream ? coverage.through : undefined;
+    if (coveredCursor !== undefined) this.resumePoint = { cursor: coveredCursor, stale: false };
     this.channel = undefined;
     this.eventStream = undefined;
+    this.streamCoverage = undefined;
     void stream?.close().catch(() => undefined);
     void channel?.close().catch(() => undefined);
-    this.scheduleEventReconnect({ staleCursor: false });
+    this.scheduleEventReconnect({
+      ...(this.resumePoint?.cursor === undefined ? {} : { lastEventId: this.resumePoint.cursor }),
+      staleCursor: false,
+    });
   }
 
   private scheduleHeartbeat(record: RegistrationRecord): void {
+    if (!record.active) return;
     if (record.heartbeatTimer) this.scheduler.clear(record.heartbeatTimer);
     record.heartbeatTimer = this.scheduler.set(
       () => {
@@ -1005,7 +2028,13 @@ export class AgentBusRuntime {
   }
 
   private async heartbeat(record: RegistrationRecord): Promise<void> {
-    if (this.disposed || this.registrations.get(record.hostSessionId) !== record) return;
+    if (
+      this.disposed ||
+      !record.active ||
+      this.registrations.get(record.hostSessionId) !== record
+    ) {
+      return;
+    }
     try {
       const generation = this.activeGeneration();
       await this.ensureConnection();

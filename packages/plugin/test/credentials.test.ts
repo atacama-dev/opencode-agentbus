@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { METHODS } from "@opencode-agentbus/protocol";
 
-import { readCredentialFileSecure, resolveTrustedConnectionConfig } from "../src/credentials";
+import {
+  readCredentialFileIfPresentSecure,
+  readCredentialFileSecure,
+  resolveTrustedConnectionConfig,
+} from "../src/credentials";
 import { SAFE_MODEL_ERRORS } from "../src/errors";
 import { AgentBusRuntime } from "../src/runtime";
 import {
@@ -49,14 +53,23 @@ describe("trusted connection config and secure credential loading", () => {
     const fromEnvironment = resolveTrustedConnectionConfig(
       {},
       {
+        HOME: "/home/agentbus-env",
         OPENCODE_AGENTBUS_CREDENTIAL_FILE: "/env/credential",
         OPENCODE_AGENTBUS_ENDPOINT: "http://127.0.0.1:5000",
         OPENCODE_AGENTBUS_TIMEOUT_MS: "800",
+        OPENCODE_AGENTBUS_AUTO_START_BROKER: "false",
+        OPENCODE_AGENTBUS_BROKER_STARTUP_TIMEOUT_MS: "1200",
+        OPENCODE_AGENTBUS_WAKE_ON_MESSAGE: "true",
+        OPENCODE_AGENTBUS_FOCUS_ON_RECEIVE_APPROVAL: "true",
       },
     );
     expect(String(fromEnvironment.endpoint)).toBe("http://127.0.0.1:5000");
     expect(fromEnvironment.credentialFilePath).toBe("/env/credential");
     expect(fromEnvironment.timeoutMs).toBe(800);
+    expect(fromEnvironment.autoStartBroker).toBe(false);
+    expect(fromEnvironment.brokerStartupTimeoutMs).toBe(1_200);
+    expect(fromEnvironment.wakeOnMessage).toBe(true);
+    expect(fromEnvironment.focusOnReceiveApproval).toBe(true);
     for (const endpoint of [
       "http://localhost:4097",
       "http://user:pass@127.0.0.1:4097",
@@ -65,6 +78,65 @@ describe("trusted connection config and secure credential loading", () => {
     ]) {
       expect(() =>
         resolveTrustedConnectionConfig({ credentialFilePath: "/secure/credential", endpoint }, {}),
+      ).toThrow(SAFE_MODEL_ERRORS.INVALID_CONFIG);
+    }
+    expect(() =>
+      resolveTrustedConnectionConfig(
+        { credentialFilePath: "/secure/credential", arbitraryCommand: "unsafe" } as never,
+        {},
+      ),
+    ).toThrow(SAFE_MODEL_ERRORS.INVALID_CONFIG);
+  });
+
+  test("defaults autostart and bounded startup timeout while allowing trusted option overrides", () => {
+    expect(resolveTrustedConnectionConfig({}, { HOME: "/home/agentbus" })).toMatchObject({
+      endpoint: "http://127.0.0.1:4097",
+      timeoutMs: 5_000,
+      credentialFilePath: "/home/agentbus/.config/opencode-agentbus/credential.json",
+      autoStartBroker: true,
+      brokerStartupTimeoutMs: 5_000,
+      wakeOnMessage: false,
+      focusOnReceiveApproval: false,
+    });
+    expect(
+      resolveTrustedConnectionConfig(
+        {
+          credentialFilePath: "/secure/credential",
+          autoStartBroker: false,
+          brokerStartupTimeoutMs: 250,
+          wakeOnMessage: true,
+          focusOnReceiveApproval: true,
+        },
+        {},
+      ),
+    ).toMatchObject({
+      autoStartBroker: false,
+      brokerStartupTimeoutMs: 250,
+      wakeOnMessage: true,
+      focusOnReceiveApproval: true,
+    });
+    for (const brokerStartupTimeoutMs of [99, 30_001, 1.5, Number.NaN]) {
+      expect(() =>
+        resolveTrustedConnectionConfig(
+          { credentialFilePath: "/secure/credential", brokerStartupTimeoutMs },
+          {},
+        ),
+      ).toThrow(SAFE_MODEL_ERRORS.INVALID_CONFIG);
+    }
+    for (const value of ["1", "yes", "TRUE", ""]) {
+      expect(() =>
+        resolveTrustedConnectionConfig(
+          { credentialFilePath: "/secure/credential" },
+          { OPENCODE_AGENTBUS_AUTO_START_BROKER: value },
+        ),
+      ).toThrow(SAFE_MODEL_ERRORS.INVALID_CONFIG);
+    }
+    for (const option of ["wakeOnMessage", "focusOnReceiveApproval"] as const) {
+      expect(() =>
+        resolveTrustedConnectionConfig(
+          { credentialFilePath: "/secure/credential", [option]: "yes" },
+          {},
+        ),
       ).toThrow(SAFE_MODEL_ERRORS.INVALID_CONFIG);
     }
   });
@@ -83,6 +155,18 @@ describe("trusted connection config and secure credential loading", () => {
     await expect(readCredentialFileSecure(path)).rejects.toThrow(
       SAFE_MODEL_ERRORS.INVALID_CREDENTIAL,
     );
+  });
+
+  test("treats only an absent credential as first-run state", async () => {
+    const directory = await tempDirectory();
+    const path = join(directory, "credential.json");
+    await expect(readCredentialFileIfPresentSecure(path)).resolves.toBeUndefined();
+
+    await writeFile(path, "not-json", { mode: 0o600 });
+    await expect(readCredentialFileIfPresentSecure(path)).rejects.toThrow(
+      SAFE_MODEL_ERRORS.INVALID_CREDENTIAL,
+    );
+    expect(await readFile(path, "utf8")).toBe("not-json");
   });
 
   test("rejects symlinks and detects replacement between path check and descriptor read", async () => {
@@ -105,7 +189,7 @@ describe("trusted connection config and secure credential loading", () => {
     ).rejects.toThrow(SAFE_MODEL_ERRORS.INVALID_CREDENTIAL);
   });
 
-  test("credential rotation reconnects, reinitializes, and re-registers before use", async () => {
+  test("credential rotation reconnects and resolves foreground identity only for the real operation", async () => {
     let snapshot = credentialSnapshot(TOKEN_A, "file-v1");
     const channels: MockChannel[] = [];
     let counter = 0;
@@ -124,6 +208,8 @@ describe("trusted connection config and secure credential loading", () => {
     });
     const toolContext = {
       sessionID: "host_rotate",
+      directory: "/worktree",
+      worktree: "/worktree",
       ask: async () => undefined,
     };
     await runtime.receive(toolContext);
@@ -137,8 +223,8 @@ describe("trusted connection config and secure credential loading", () => {
     expect(channels[0]?.closed).toBe(true);
     expect(channels[1]?.calls.map((request) => request.method).slice(0, 3)).toEqual([
       METHODS.HANDSHAKE,
-      METHODS.REGISTER_SESSION,
-      METHODS.LIST_PENDING_MESSAGES,
+      METHODS.RESOLVE_FOREGROUND_SESSION,
+      METHODS.ENQUEUE_MESSAGE,
     ]);
     await runtime.dispose();
   });

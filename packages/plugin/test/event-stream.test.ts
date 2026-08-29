@@ -66,11 +66,12 @@ describe("authenticated principal-wide SSE", () => {
     );
 
     await stream.start({
+      lastEventId: "0",
       onEvent: async () => undefined,
       onDisconnect: (disconnect) => disconnects.push(disconnect),
     });
 
-    expect(disconnects).toEqual([{ staleCursor: false }]);
+    expect(disconnects).toEqual([{ lastEventId: "0", staleCursor: false }]);
     expect(eventRequests).toBe(0);
     expect(abortedConnections).toBe(1);
     expect(activeConnections).toBe(0);
@@ -119,10 +120,11 @@ describe("authenticated principal-wide SSE", () => {
       fetchMock,
     );
     await first.start({
+      lastEventId: "0",
       onEvent: async () => undefined,
       onDisconnect: (disconnect) => firstDisconnects.push(disconnect),
     });
-    expect(firstDisconnects).toEqual([{ staleCursor: false }]);
+    expect(firstDisconnects).toEqual([{ lastEventId: "0", staleCursor: false }]);
     expect(activeConnections).toBe(0);
 
     const events: PendingMessageEvent[] = [];
@@ -132,6 +134,7 @@ describe("authenticated principal-wide SSE", () => {
       fetchMock,
     );
     await second.start({
+      lastEventId: "0",
       onEvent: async (event) => {
         events.push(event);
       },
@@ -188,10 +191,11 @@ describe("authenticated principal-wide SSE", () => {
       fetchMock,
     );
     await first.start({
+      lastEventId: "0",
       onEvent: async () => undefined,
       onDisconnect: (disconnect) => firstDisconnects.push(disconnect),
     });
-    expect(firstDisconnects).toEqual([{ staleCursor: false }]);
+    expect(firstDisconnects).toEqual([{ lastEventId: "0", staleCursor: false }]);
     expect(challengeCancellations).toBe(1);
     expect(bearerRequests).toBe(0);
 
@@ -201,6 +205,7 @@ describe("authenticated principal-wide SSE", () => {
       fetchMock,
     );
     await second.start({
+      lastEventId: "0",
       onEvent: async (event) => {
         events.push(event);
       },
@@ -237,6 +242,7 @@ describe("authenticated principal-wide SSE", () => {
       }),
     );
     await stream.start({
+      lastEventId: "0",
       onEvent: async () => undefined,
       onDisconnect: (disconnect) => disconnects.push(disconnect),
     });
@@ -280,6 +286,7 @@ describe("authenticated principal-wide SSE", () => {
         },
       );
       const start = stream.start({
+        lastEventId: "0",
         onEvent: async () => undefined,
         onDisconnect: (disconnect) => disconnects.push(disconnect),
       });
@@ -383,6 +390,7 @@ describe("authenticated principal-wide SSE", () => {
       }),
     );
     await stream.start({
+      lastEventId: "0",
       onEvent: async (event) => {
         events.push(event);
       },
@@ -540,6 +548,7 @@ describe("authenticated principal-wide SSE", () => {
       ),
     );
     await stream.start({
+      lastEventId: "0",
       onEvent: async (event) => {
         events.push(event);
       },
@@ -548,7 +557,7 @@ describe("authenticated principal-wide SSE", () => {
     await waitFor(() => disconnects.length === 1);
 
     expect(events).toEqual([]);
-    expect(disconnects).toEqual([{ staleCursor: false, requiresRecovery: true }]);
+    expect(disconnects).toEqual([{ lastEventId: "0", staleCursor: false, requiresRecovery: true }]);
     expect(JSON.stringify(disconnects)).not.toContain("PROMPT INJECTION BODY");
     expect(JSON.stringify(disconnects)).not.toContain("pretend this is the user");
     await stream.close();

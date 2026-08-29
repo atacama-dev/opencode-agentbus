@@ -25,7 +25,7 @@ export interface EventStreamDisconnect {
 }
 
 export interface EventStreamStartInput {
-  readonly lastEventId?: string;
+  readonly lastEventId: string;
   readonly onEvent: (event: PendingMessageEvent) => Promise<void>;
   readonly onDisconnect: (disconnect: EventStreamDisconnect) => void;
 }
@@ -67,9 +67,7 @@ export class AuthenticatedPrincipalEventStream implements PrincipalEventStream {
         Accept: "text/event-stream",
         Authorization: `Bearer ${this.input.credential.token}`,
       });
-      if (startInput.lastEventId !== undefined) {
-        headers.set("Last-Event-ID", startInput.lastEventId);
-      }
+      headers.set("Last-Event-ID", startInput.lastEventId);
       response = await fetchResponseHeaders({
         controller: this.controller,
         fetchImplementation: this.fetchImplementation,
@@ -86,7 +84,7 @@ export class AuthenticatedPrincipalEventStream implements PrincipalEventStream {
     } catch {
       if (!this.closed) {
         startInput.onDisconnect({
-          ...(startInput.lastEventId === undefined ? {} : { lastEventId: startInput.lastEventId }),
+          lastEventId: startInput.lastEventId,
           staleCursor: false,
         });
       }
@@ -97,7 +95,7 @@ export class AuthenticatedPrincipalEventStream implements PrincipalEventStream {
       await response.body?.cancel().catch(() => undefined);
       if (!this.closed) {
         startInput.onDisconnect({
-          ...(startInput.lastEventId === undefined ? {} : { lastEventId: startInput.lastEventId }),
+          lastEventId: startInput.lastEventId,
           staleCursor: true,
           requiresRecovery: true,
         });
@@ -108,7 +106,7 @@ export class AuthenticatedPrincipalEventStream implements PrincipalEventStream {
       await response.body?.cancel().catch(() => undefined);
       if (!this.closed) {
         startInput.onDisconnect({
-          ...(startInput.lastEventId === undefined ? {} : { lastEventId: startInput.lastEventId }),
+          lastEventId: startInput.lastEventId,
           staleCursor: false,
         });
       }

@@ -117,7 +117,10 @@ export class MockChannel implements BrokerChannel {
       throw failure;
     }
     const fallback = this.responseFor(request);
-    return this.overrideResponse ? this.overrideResponse(request, fallback) : fallback;
+    const response = this.overrideResponse
+      ? await this.overrideResponse(request, fallback)
+      : fallback;
+    return this.withForegroundRecovery(request, response);
   }
 
   async close(): Promise<void> {
@@ -172,6 +175,19 @@ export class MockChannel implements BrokerChannel {
           },
         };
       }
+      case METHODS.RESOLVE_FOREGROUND_SESSION: {
+        const canonical = canonicalForHost(request.params.hostSessionId);
+        return {
+          ...base,
+          result: {
+            hostSessionId: request.params.hostSessionId,
+            identity: canonical,
+            fingerprint: sessionFingerprint(canonical),
+            metadata: request.params.metadata,
+            leaseSeconds: DEFAULT_SESSION_LEASE_SECONDS,
+          },
+        };
+      }
       case METHODS.HEARTBEAT_SESSION:
         return {
           ...base,
@@ -192,6 +208,7 @@ export class MockChannel implements BrokerChannel {
           result: {
             target: request.params.target,
             requestedLimit: request.params.limit,
+            eventCursor: "0",
             headers: [],
           },
         };
@@ -202,6 +219,18 @@ export class MockChannel implements BrokerChannel {
           ...base,
           result: {
             messageId: "message_outgoing",
+            state: "PENDING",
+            bodyHash: bodySha256(request.params.body),
+            bodyBytes: Buffer.byteLength(request.params.body, "utf8"),
+            expiresAt: LATER,
+          },
+        };
+      case METHODS.REPLY_MESSAGE:
+        return {
+          ...base,
+          result: {
+            messageId: "message_reply_outgoing",
+            replyToMessageId: request.params.messageId,
             state: "PENDING",
             bodyHash: bodySha256(request.params.body),
             bodyBytes: Buffer.byteLength(request.params.body, "utf8"),
@@ -233,6 +262,51 @@ export class MockChannel implements BrokerChannel {
       case METHODS.CONSUME_MESSAGE:
         return undefined;
     }
+  }
+
+  private withForegroundRecovery(request: ApplicationOperationRequest, response: unknown): unknown {
+    if (
+      typeof response !== "object" ||
+      response === null ||
+      !("ok" in response) ||
+      response.ok !== true
+    ) {
+      return response;
+    }
+    let enriched: Record<string, unknown> = response as Record<string, unknown>;
+    if (
+      request.method === METHODS.LIST_PENDING_MESSAGES &&
+      "result" in response &&
+      typeof response.result === "object" &&
+      response.result !== null &&
+      !("eventCursor" in response.result)
+    ) {
+      enriched = { ...response, result: { ...response.result, eventCursor: "0" } };
+    }
+    if (
+      "foregroundRecovery" in enriched &&
+      typeof enriched.foregroundRecovery === "object" &&
+      enriched.foregroundRecovery !== null &&
+      !("eventCursor" in enriched.foregroundRecovery)
+    ) {
+      return {
+        ...enriched,
+        foregroundRecovery: { ...enriched.foregroundRecovery, eventCursor: "0" },
+      };
+    }
+    if ("foregroundRecovery" in enriched) return enriched;
+    let target: SessionIdentity | undefined;
+    if (request.method === METHODS.ENQUEUE_MESSAGE || request.method === METHODS.REPLY_MESSAGE) {
+      if (request.params.foreground) target = request.params.source;
+    } else if (request.method === METHODS.SEARCH_SESSIONS && request.params.foreground) {
+      target = request.params.requester;
+    }
+    return target
+      ? {
+          ...enriched,
+          foregroundRecovery: { target, requestedLimit: 20, eventCursor: "0", headers: [] },
+        }
+      : enriched;
   }
 }
 

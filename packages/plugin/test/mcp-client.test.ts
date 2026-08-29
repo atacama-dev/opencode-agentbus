@@ -205,6 +205,7 @@ describe("custom JSON-RPC mapping over the official MCP transport", () => {
         fetchMock,
       );
       void stream.start({
+        lastEventId: "0",
         onEvent: async () => undefined,
         onDisconnect: () => {
           void stream.close();
@@ -317,11 +318,11 @@ describe("custom JSON-RPC mapping over the official MCP transport", () => {
 
     expect(inner.sent).toEqual([toMcpJsonRpcRequest(request)]);
     const response = HandshakeSuccessEnvelopeSchema.parse({
-      protocolVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
       requestId: request.requestId,
       ok: true as const,
       result: {
-        selectedProtocolVersion: 1 as const,
+        selectedProtocolVersion: PROTOCOL_VERSION,
         broker: { brokerId: "broker_01", serverId: "server_01" },
         mcp: {
           transport: "streamable_http" as const,
@@ -389,11 +390,11 @@ describe("custom JSON-RPC mapping over the official MCP transport", () => {
       if (body?.method === "notifications/initialized") return new Response(null, { status: 202 });
       const application = body?.params as ApplicationOperationRequest;
       const response = HandshakeSuccessEnvelopeSchema.parse({
-        protocolVersion: 1,
+        protocolVersion: PROTOCOL_VERSION,
         requestId: application.requestId,
         ok: true as const,
         result: {
-          selectedProtocolVersion: 1 as const,
+          selectedProtocolVersion: PROTOCOL_VERSION,
           broker: { brokerId: "broker_01", serverId: "server_01" },
           mcp: {
             transport: "streamable_http" as const,
@@ -421,10 +422,10 @@ describe("custom JSON-RPC mapping over the official MCP transport", () => {
     });
     const verifiedBroker = await channel.connect();
     const application = HandshakeRequestSchema.parse({
-      protocolVersion: 1,
+      protocolVersion: PROTOCOL_VERSION,
       requestId: "request_custom",
       method: METHODS.HANDSHAKE,
-      params: { supportedProtocolVersions: [1] },
+      params: { supportedProtocolVersions: [PROTOCOL_VERSION] },
     });
     await channel.request(application);
     await Promise.all([
