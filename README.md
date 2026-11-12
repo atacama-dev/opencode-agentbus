@@ -42,6 +42,8 @@ When the reply is delivered, its pending header and `peer_message` include the o
 
 ## Build
 
+Machine-specific paths and service recipes belong in the git-ignored `.local/` directory, not in shared documentation. See the [manual attached-client QA procedure](docs/manual-qa.md) for a portable checklist.
+
 ```bash
 bun install --frozen-lockfile
 bun run build
@@ -185,3 +187,9 @@ See:
 - [`docs/broker-lifecycle-decision.md`](docs/broker-lifecycle-decision.md)
 - [`docs/implementation-plan.md`](docs/implementation-plan.md)
 - [`docs/qa.md`](docs/qa.md)
+
+## License
+
+Copyright (C) 2026 Julien Tesson <julien@atacama.tech>.
+
+OpenCode Agent Bus is free software: you can redistribute it and/or modify it under the GNU General Public License, version 3 or (at your option) any later version. It is distributed without any warranty, including the implied warranties of merchantability or fitness for a particular purpose. See [LICENSE](LICENSE) for the full terms and [dependency licensing notes](docs/licensing.md) for redistribution constraints.

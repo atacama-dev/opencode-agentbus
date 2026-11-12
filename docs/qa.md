@@ -120,7 +120,7 @@ Automated coverage validates:
 - all four tools parse trusted per-call `ToolContext.sessionID` with `HostSessionIdSchema`, parse the exact returned registration with strict `ForegroundSessionSchema`, and complete exact-directory/session/project checks before broker readiness or runtime work;
 - context and current-project worktrees are each required to be absolute and independently contain the exact directory, while valid unequal roots include global `/` plus a specific attached workspace and different nested roots; unrelated, escaping, or non-absolute roots fail pre-broker for send, reply, receive, and search;
 - one successful call performs exactly one host validation in `session` → `project` → `ready` → `runtime` order, and the runtime strictly correlates the prevalidated registration without a second host query;
-- a built server-mode composition uses a compatible simulated host with plugin startup at `/home/test-user`, a global current-project worktree `/`, and a more-specific attached ToolContext worktree; it executes search/send/receive/reply and verifies that static root scope and model-forged directory/worktree fields neither block nor override the trusted caller;
+- a built server-mode composition uses a compatible simulated host with plugin startup at a simulated user home, a global current-project worktree `/`, and a more-specific attached ToolContext worktree; it executes search/send/receive/reply and verifies that static root scope and model-forged directory/worktree fields neither block nor override the trusted caller;
 - invalid-character, control/Unicode-unsafe, empty, oversized, mismatched, malformed-metadata, missing, duplicate, failed, wrong-project, wrong-directory, and wrong-worktree host results return canonical unavailable and execute no broker readiness, authentication/probe/launch path, channel admission, or model operation;
 - independent `/workspace/A` and `/workspace/B` sessions route status, pending toast, fixed wake, TUI selection, and approval warning only through their own trusted directories;
 - trusted route entries are bounded to 256, refreshed by foreground/lifecycle data, removed on deletion, and cleared on disposal, while peer titles and bodies cannot select or leak a route;
@@ -181,11 +181,11 @@ This increment introduces no new TUI permission flow: `agentbus_reply` does not 
 ## Remaining release gates
 
 - Run the root-only wrong-owner database-file test in privileged security CI before public release.
-- Run the opt-in real OpenCode server gate below. It intentionally restarts the user's selected OpenCode service and sends live messages, so it is not part of deterministic automation and has not been run in this increment.
+- Run the opt-in real OpenCode server gate below. It changes the selected test server's configuration, may require a restart, and sends live messages, so it is not part of deterministic automation and has not been run in this increment.
 
 ## Opt-in real OpenCode server gate
 
-Installation-specific service recipes are kept in ignored local notes. For a real-host check, use two distinct attached workspaces under a broader server root, keep native receive/search approval enabled, and verify search, send, receive, reply, rejection, fixed wakes, and target-only UI routing. Record actual host versions and observations; simulated integration coverage does not establish this gate.
+Follow the [manual attached-client QA procedure](manual-qa.md). It preserves the server-root/attached-workspace condition and the eight acceptance observations without assuming a particular home directory, binary path, second project, or systemd unit. Keep machine-specific commands and results in the ignored `.local/` directory. This gate remains unrun; simulated integration coverage does not establish installed-host acceptance.
 
 ## Wake and approval visibility increment
 

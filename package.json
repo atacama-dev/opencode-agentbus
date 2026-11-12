@@ -2,6 +2,7 @@
   "name": "opencode-agentbus",
   "version": "0.1.0",
   "private": true,
+  "license": "GPL-3.0-or-later",
   "type": "module",
   "packageManager": "bun@1.3.9",
   "workspaces": ["packages/*"],
