@@ -67,7 +67,6 @@ import type {
   SessionMetadata,
   TrustedConnectionConfig,
 } from "@opencode-agentbus/protocol";
-import type { ToolContext, ToolResult } from "@opencode-ai/plugin";
 
 import type { SecureCredentialSnapshot } from "./credentials";
 import { readCredentialFileSecure, sameCredentialSnapshot } from "./credentials";
@@ -86,11 +85,34 @@ interface Schema<T> {
   parse(value: unknown): T;
 }
 
-export type TrustedForegroundToolContext = Pick<
-  ToolContext,
-  "sessionID" | "directory" | "worktree"
->;
-export type AgentBusToolContext = TrustedForegroundToolContext & Pick<ToolContext, "ask">;
+export interface TrustedForegroundToolContext {
+  readonly sessionID: string;
+  readonly directory: string;
+  readonly worktree: string;
+}
+export type ToolResult =
+  | string
+  | {
+      readonly title?: string;
+      readonly output: string;
+      readonly metadata?: Record<string, unknown>;
+    };
+export type AgentBusToolContext = TrustedForegroundToolContext & {
+  readonly ask: (input: {
+    permission: string;
+    patterns: string[];
+    always: string[];
+    metadata: Record<string, unknown>;
+  }) => Promise<void>;
+  readonly signal?: AbortSignal;
+  readonly beforeOperation?: () => Promise<void>;
+  readonly assertPermission?: (policy: {
+    readonly action: string;
+    readonly resources: readonly string[];
+    readonly save: readonly string[];
+    readonly metadata: Readonly<Record<string, unknown>>;
+  }) => Promise<void>;
+};
 
 export interface RuntimeScheduler {
   readonly set: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
@@ -191,6 +213,10 @@ interface SearchInput {
 
 const MAX_RECEIVE_OBSERVATION_ATTEMPTS = 3;
 const MAX_PRINCIPAL_CONVERGENCE_ATTEMPTS = 5;
+
+function assertToolSignal(context: AgentBusToolContext): void {
+  if (context.signal?.aborted) throw context.signal.reason;
+}
 
 function safeRequestId(requestId: string): string {
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(requestId)) {
@@ -337,12 +363,14 @@ export class AgentBusRuntime {
     trustedForeground?: ForegroundSession,
   ): Promise<ToolResult> {
     try {
+      assertToolSignal(context);
       const generation = this.activeGeneration();
       const { record, foreground } = await this.ensureForegroundRegistration(
         context,
         trustedForeground,
       );
       this.assertActive(generation);
+      assertToolSignal(context);
       const targetHandle = parseInput(SessionIdSchema, input.target);
       const target =
         record.approvedTargets.get(input.target) ??
@@ -362,6 +390,9 @@ export class AgentBusRuntime {
           foreground,
         },
       });
+      await context.beforeOperation?.();
+      this.assertActive(generation);
+      assertToolSignal(context);
       const response = await this.requestAndParse(request, EnqueueMessageResponseSchema);
       if (!response.ok) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
       if (!enqueueResultMatchesRequest(request, response.result)) throw this.invalidResponse();
@@ -383,6 +414,7 @@ export class AgentBusRuntime {
         },
       };
     } catch (error) {
+      if (context.signal?.aborted && error === context.signal.reason) throw error;
       throw asSafeModelError(error);
     }
   }
@@ -393,12 +425,14 @@ export class AgentBusRuntime {
     trustedForeground?: ForegroundSession,
   ): Promise<ToolResult> {
     try {
+      assertToolSignal(context);
       const generation = this.activeGeneration();
       const { record, foreground } = await this.ensureForegroundRegistration(
         context,
         trustedForeground,
       );
       this.assertActive(generation);
+      assertToolSignal(context);
       const request = parseInput(ReplyMessageRequestSchema, {
         protocolVersion: PROTOCOL_VERSION,
         requestId: this.nextRequestId(),
@@ -411,6 +445,9 @@ export class AgentBusRuntime {
           foreground,
         },
       });
+      await context.beforeOperation?.();
+      this.assertActive(generation);
+      assertToolSignal(context);
       const response = await this.requestAndParse(request, ReplyMessageResponseSchema);
       if (!response.ok) throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
       if (!replyResultMatchesRequest(request, response.result)) throw this.invalidResponse();
@@ -433,6 +470,7 @@ export class AgentBusRuntime {
         },
       };
     } catch (error) {
+      if (context.signal?.aborted && error === context.signal.reason) throw error;
       throw asSafeModelError(error);
     }
   }
@@ -441,7 +479,9 @@ export class AgentBusRuntime {
     context: AgentBusToolContext,
     trustedForeground?: ForegroundSession,
   ): Promise<ToolResult> {
+    let nativeFailure: { readonly error: unknown } | undefined;
     try {
+      assertToolSignal(context);
       const generation = this.activeGeneration();
       const { record, foreground } = await this.ensureForegroundRegistration(
         context,
@@ -503,20 +543,42 @@ export class AgentBusRuntime {
         bodyHash: header.bodyHash,
         bodyBytes: header.bodyBytes,
       });
-      try {
-        await context.ask({
-          permission: "agentbus_receive",
-          patterns: [exactResource],
-          always: [exactResource],
-          metadata: permissionMetadata,
-        });
-      } catch {
-        // OpenCode 1.18.19 exposes no stable typed explicit-denial signal; every failure stays pending.
-        throw new SafeModelError(SAFE_MODEL_ERRORS.RECEIVE_DENIED);
-      }
+      if (context.assertPermission) {
+        try {
+          await context.assertPermission({
+            action: "agentbus_receive",
+            resources: [exactResource],
+            save: [exactResource],
+            metadata: permissionMetadata,
+          });
+        } catch (error) {
+          nativeFailure = { error };
+          throw error;
+        }
+      } else
+        try {
+          await context.ask({
+            permission: "agentbus_receive",
+            patterns: [exactResource],
+            always: [exactResource],
+            metadata: permissionMetadata,
+          });
+        } catch {
+          // OpenCode 1.18.19 exposes no stable typed explicit-denial signal; every failure stays pending.
+          throw new SafeModelError(SAFE_MODEL_ERRORS.RECEIVE_DENIED);
+        }
       this.assertActive(generation);
+      if (context.signal?.aborted) {
+        nativeFailure = { error: context.signal.reason };
+        throw context.signal.reason;
+      }
       if (!(await this.canConsumeReceiveObservation(record, header, receiveObservation))) {
         throw new SafeModelError(SAFE_MODEL_ERRORS.OPERATION_FAILED);
+      }
+      this.assertActive(generation);
+      if (context.signal?.aborted) {
+        nativeFailure = { error: context.signal.reason };
+        throw context.signal.reason;
       }
 
       const consumeRequest = parseInput(ConsumeMessageRequestSchema, {
@@ -530,6 +592,9 @@ export class AgentBusRuntime {
           foreground,
         },
       });
+      await context.beforeOperation?.();
+      this.assertActive(generation);
+      assertToolSignal(context);
       const consumeResponse = await this.requestAndParse(
         consumeRequest,
         ConsumeMessageResponseSchema,
@@ -559,6 +624,8 @@ export class AgentBusRuntime {
         },
       };
     } catch (error) {
+      if (nativeFailure && nativeFailure.error === error) throw error;
+      if (context.signal?.aborted && error === context.signal.reason) throw error;
       throw asSafeModelError(error);
     }
   }
@@ -568,7 +635,9 @@ export class AgentBusRuntime {
     context: AgentBusToolContext,
     trustedForeground?: ForegroundSession,
   ): Promise<ToolResult> {
+    let nativeFailure: { readonly error: unknown } | undefined;
     try {
+      assertToolSignal(context);
       const generation = this.activeGeneration();
       const canonicalQuery = normalizeSearchQuery(input.query);
       const { record, foreground } = await this.ensureForegroundRegistration(
@@ -578,16 +647,36 @@ export class AgentBusRuntime {
       this.assertActive(generation);
       const scope = record.registration.identity.broker;
       const exactResource = searchPermissionResource(scope, canonicalQuery);
-      await context.ask({
-        permission: "agentbus_search_sessions",
-        patterns: [exactResource],
-        always: [],
-        metadata: {
-          scopeFingerprint: brokerScopeFingerprint(scope),
-          queryHash: hashNormalizedSearchQuery(canonicalQuery),
-        },
-      });
+      if (context.assertPermission) {
+        try {
+          await context.assertPermission({
+            action: "agentbus_search_sessions",
+            resources: [exactResource],
+            save: [],
+            metadata: {
+              scopeFingerprint: brokerScopeFingerprint(scope),
+              queryHash: hashNormalizedSearchQuery(canonicalQuery),
+            },
+          });
+        } catch (error) {
+          nativeFailure = { error };
+          throw error;
+        }
+      } else
+        await context.ask({
+          permission: "agentbus_search_sessions",
+          patterns: [exactResource],
+          always: [],
+          metadata: {
+            scopeFingerprint: brokerScopeFingerprint(scope),
+            queryHash: hashNormalizedSearchQuery(canonicalQuery),
+          },
+        });
       this.assertActive(generation);
+      if (context.signal?.aborted) {
+        nativeFailure = { error: context.signal.reason };
+        throw context.signal.reason;
+      }
       const request = parseInput(SearchSessionsRequestSchema, {
         protocolVersion: PROTOCOL_VERSION,
         requestId: this.nextRequestId(),
@@ -600,6 +689,9 @@ export class AgentBusRuntime {
           foreground,
         },
       });
+      await context.beforeOperation?.();
+      this.assertActive(generation);
+      assertToolSignal(context);
       const response = await this.requestAndParse(request, SearchSessionsResponseSchema);
       if (!response.ok || !searchResultMatchesRequest(request, response.result)) {
         throw this.invalidResponse();
@@ -634,6 +726,8 @@ export class AgentBusRuntime {
         },
       };
     } catch (error) {
+      if (nativeFailure && nativeFailure.error === error) throw error;
+      if (context.signal?.aborted && error === context.signal.reason) throw error;
       throw asSafeModelError(error);
     }
   }
@@ -766,7 +860,7 @@ export class AgentBusRuntime {
   }
 
   private async ensureForegroundRegistration(
-    context: TrustedForegroundToolContext,
+    context: AgentBusToolContext,
     trustedForeground?: ForegroundSession,
   ): Promise<ForegroundRegistration> {
     const generation = this.activeGeneration();
@@ -810,6 +904,9 @@ export class AgentBusRuntime {
     }
     await this.ensureConnection();
     this.assertActive(generation);
+    await context.beforeOperation?.();
+    this.assertActive(generation);
+    assertToolSignal(context);
     const existing = this.registrations.get(hostSessionId);
     if (this.desiredSessions.has(hostSessionId)) {
       this.setDesiredSession(hostSessionId, foreground.metadata);
@@ -819,6 +916,9 @@ export class AgentBusRuntime {
       return { record: existing, foreground };
     }
     await this.enqueueSessionWork(hostSessionId, async () => {
+      await context.beforeOperation?.();
+      this.assertActive(generation);
+      assertToolSignal(context);
       if (this.registrations.has(hostSessionId)) return;
       await this.resolveForegroundIdentity(foreground, generation);
     });
