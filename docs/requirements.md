@@ -4,7 +4,7 @@
 
 OpenCode Agent Bus provides secure, local, asynchronous messaging between opted-in OpenCode sessions owned by one operating-system user. It does not federate across machines or operating-system identities.
 
-**Design revision, 2026-11-12:** the owner explicitly removed project placement as an authorization boundary. The stable authenticated session and target/source approval pair govern messaging; project association is for discovery only. A moved session may receive messages addressed before its move. Automatic fixed wakes remain required when enabled. See [session identity and wake decision](session-identity-decision.md). Legacy placement-oriented tests below are historical implementation evidence, not a reason to restore the removed restriction.
+**Design revision, 2026-11-12:** the owner explicitly removed project placement as an authorization boundary. The stable authenticated session and target/source approval pair govern messaging; project association is for discovery only. A moved session may receive messages addressed before its move. Automatic fixed wakes remain required when enabled. See [session identity and wake decision](session-identity-decision.md). Legacy placement-oriented tests and QA records are historical implementation evidence, not a reason to restore the removed restriction.
 
 ## Functional requirements
 
