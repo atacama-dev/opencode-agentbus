@@ -11,9 +11,34 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/v2.d.ts",
+      "import": "./dist/v2.js",
+      "default": "./dist/v2.js"
+    },
+    "./v2": {
+      "types": "./dist/v2.d.ts",
+      "import": "./dist/v2.js",
+      "default": "./dist/v2.js"
+    },
+    "./tui": {
+      "types": "./dist/tui-v2.d.ts",
+      "import": "./dist/tui-v2.js",
+      "default": "./dist/tui-v2.js"
+    },
+    "./rpc": {
+      "types": "./dist/rpc-v2.d.ts",
+      "import": "./dist/rpc-v2.js",
+      "default": "./dist/rpc-v2.js"
+    },
+    "./stock-experimental": {
+      "types": "./dist/stock-v2.d.ts",
+      "import": "./dist/stock-v2.js",
+      "default": "./dist/stock-v2.js"
     }
   },
-  "files": ["dist"],
+  "files": ["dist", "server.js", "tui.js", "rpc.js"],
   "scripts": {
     "test": "bun test",
     "typecheck": "bun ../../scripts/run-package-tsc.ts typecheck",
