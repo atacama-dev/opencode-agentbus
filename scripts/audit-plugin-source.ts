@@ -2,10 +2,16 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { auditProductTree } from "./audit-plugin-source-lib";
+import { auditV2ProductTree } from "./audit-v2";
 
 const rootDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pluginSourceDirectory = resolve(rootDirectory, "packages/plugin/src");
 const report = auditProductTree(pluginSourceDirectory);
+const v2Violations = auditV2ProductTree(pluginSourceDirectory);
+if (v2Violations.length) {
+  console.error("V2 host/fixed-admission audit failed:", v2Violations);
+  process.exitCode = 1;
+}
 
 if (report.violations.length > 0) {
   console.error(
