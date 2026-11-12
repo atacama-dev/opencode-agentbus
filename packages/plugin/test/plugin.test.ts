@@ -304,13 +304,10 @@ describe("OpenCode plugin export", () => {
       await Promise.all(files.map((name) => readFile(join(sourceDirectory, name), "utf8")))
     ).join("\n");
     expect(source.match(/\.promptAsync\(/gu)).toHaveLength(1);
-    for (const forbidden of [
-      ".prompt(",
-      ".synthetic(",
-      "appendPrompt(",
-      "submitPrompt(",
-      "session.messages(",
-    ]) {
+    // The public V2 session.synthetic call is separately AST-gated to its
+    // exact fixed queue text/recipient/shape by the product source auditor.
+    expect(source.match(/\.synthetic\(/gu)).toHaveLength(1);
+    for (const forbidden of [".prompt(", "appendPrompt(", "submitPrompt(", "session.messages("]) {
       expect(source).not.toContain(forbidden);
     }
     expect(source).not.toContain("mcp:");
