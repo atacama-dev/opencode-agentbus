@@ -497,6 +497,25 @@ describe("atomic consume/reject contracts", () => {
 });
 
 describe("Unicode integrity and canonical search", () => {
+  test("empty and whitespace-only queries list the registry with limits up to 200", () => {
+    expect(normalizeSearchQuery("") as string).toBe("");
+    expect(normalizeSearchQuery(" \t\u3000 ") as string).toBe("");
+    expect(CanonicalSearchQuerySchema.safeParse("").success).toBe(true);
+    const request = {
+      ...requestBase(METHODS.SEARCH_SESSIONS),
+      params: { requester: source, scope: source.broker, query: "", limit: 200 },
+    };
+    expect(SearchSessionsRequestSchema.safeParse(request).success).toBe(true);
+    for (const limit of [0, 201, 1.5]) {
+      expect(
+        SearchSessionsRequestSchema.safeParse({
+          ...request,
+          params: { ...request.params, limit },
+        }).success,
+      ).toBe(false);
+    }
+  });
+
   test("rejects isolated surrogates before sizing or hashing", () => {
     const isolated = "\ud800";
     const replacement = "\ufffd";

@@ -1420,8 +1420,10 @@ export class BrokerStore {
          WHERE principal_id = ? AND opt_in = 1 AND lease_expires_ms > ?`,
       )
       .all(principal.principalId, now)
-      .filter((row) =>
-        parseMetadataSearchFields(row.metadata_search).some((field) => field.includes(query)),
+      .filter(
+        (row) =>
+          query === "" ||
+          parseMetadataSearchFields(row.metadata_search).some((field) => field.includes(query)),
       );
   }
 
