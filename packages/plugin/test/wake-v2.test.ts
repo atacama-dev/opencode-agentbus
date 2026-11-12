@@ -247,6 +247,42 @@ for (const state of ["unknown", "projected", "pending"] as const) {
   });
 }
 
+for (const initial of ["prepared", "submitting", "uncertain"] as const) {
+  test(`unreconciled ${initial} wake remains held after the mailbox drains and refills`, async () => {
+    let stored = {
+      version: 1 as const,
+      sessionID: "ses_one",
+      id: "msg_unconfirmed",
+      text: FIXED_V2_WAKE_TEXT,
+      delivery: "queue" as const,
+      state: initial as "prepared" | "submitting" | "uncertain" | "admitted" | "closed",
+      admittedAt: 0,
+    };
+    let admissions = 0;
+    const episodes = new V2WakeEpisodes({
+      namespace: "uncertain-refill",
+      enabled: true,
+      storage: {
+        get: async () => stored,
+        set: async (_key, value) => {
+          stored = value;
+        },
+      },
+      createID: () => "msg_new",
+      resolve: async () => true,
+      activity: async () => [],
+      admit: async () => {
+        admissions++;
+      },
+    });
+    await episodes.update("ses_one", 0);
+    await episodes.update("ses_one", 1);
+    expect(admissions).toBe(0);
+    expect(stored).toMatchObject({ id: "msg_unconfirmed", state: "uncertain" });
+    episodes.dispose();
+  });
+}
+
 for (const boundary of ["resolve", "prepared", "submitting"] as const) {
   test(`removed wake generation at held ${boundary} never admits or resurrects work`, async () => {
     let release!: () => void;

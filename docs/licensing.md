@@ -6,6 +6,8 @@ Agent Bus's own code is licensed under **GPL-3.0-or-later**; the local dependenc
 
 On 2026-11-12, a read-only review inspected the workspace manifests, `bun.lock`, installed runtime dependency metadata, and available license texts. It covered 113 installed third-party runtime package/version pairs; the locked runtime closure contains 118 pairs, including five optional platform packages not installed locally. Development tools were considered separately.
 
+That inventory describes the baseline before the public OpenCode V2 SDK dependencies were added. It is not a completed review of the experimental V2 dependency graph; recheck that graph and its upstream notices before distributing a V2 package or bundle. The integration's dependency-security advisory count is tracked separately in [V2 integration status](v2-port.md).
+
 | Dependencies | License / compatibility basis |
 |---|---|
 | `@modelcontextprotocol/sdk@1.30.0`, `@opencode-ai/plugin@1.18.19`, `@opencode-ai/sdk@1.18.19`, both resolved Zod versions | MIT; compatible with GPLv3 |
