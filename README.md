@@ -11,6 +11,8 @@ The system combines:
 
 Status: implemented and end-to-end QA-validated on Linux with Bun 1.3.9 and OpenCode 1.18.19. Built integration tests cover server-root/attached-workspace behavior through a simulated OpenCode host API, and compatibility tests cover the session-status map shape observed on the currently installed OpenCode 1.18.23 runtime. The opt-in real `opencode-server` attached-client wake, TUI navigation, and approval-flow gate remains outstanding.
 
+Design update (2026-11-12, implementation pending): [project association is discovery metadata, not message authorization](docs/session-identity-decision.md). Moving a session does not revoke its mailbox or exact target/source approvals. The V2 work must preserve automatic fixed wakes when enabled; the legacy placement checks and QA claims below do not establish that revised behavior.
+
 ## Security model
 
 - Peer bodies remain in the broker until the receiving session passes native OpenCode approval.

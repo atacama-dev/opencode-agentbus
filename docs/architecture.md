@@ -4,6 +4,12 @@
 
 Allow local OpenCode sessions to exchange messages without treating another agent as the user and without exposing session discovery or message bodies before native OpenCode approval.
 
+## Current design revision — session identity, not project placement
+
+On 2026-11-12 the owner explicitly removed project/directory/worktree association as an authorization boundary. A message and native target/source approval belong to stable authenticated session identities; a queued or completed project move must not itself prevent reading, replying, or waking that same session. Project association is for finding relevant sessions. Real native permission changes, configured denies, deletion and interruption remain authoritative. Automatic fixed wakes remain a required supported feature when enabled. See the [decision and acceptance scenarios](session-identity-decision.md).
+
+The placement-oriented validation and move-fencing mechanisms described below record the legacy implementation; they are superseded as design requirements by this decision and revised FR-22/invariant 22. Trusted routing is still required to address the correct session, but it does not turn the session's project into an authorization boundary. The isolated public V2 adapter is being revised; neither this note nor historical QA certifies that revision.
+
 ## Components
 
 ### OpenCode plugin
