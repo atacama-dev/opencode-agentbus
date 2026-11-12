@@ -17,7 +17,9 @@ Status: implemented and end-to-end QA-validated on Linux with Bun 1.3.9 and Open
 
 [Installable V1 archives and release automation](docs/releasing.md) are prepared and tested. V1 `0.1.0` is selected for the initial release; the maintainer has accepted deferring fresh manual native-host acceptance, as recorded in [QA evidence](docs/qa.md#initial-v1-010-release-decision). This is not a claim that the outstanding native tests passed. Dependency findings remain visible under an [expiring risk-acceptance policy](docs/dependency-exceptions.md), not a clean-audit claim.
 
-Design update (2026-11-12, implementation pending): [project association is discovery metadata, not message authorization](docs/session-identity-decision.md). Moving a session does not revoke its mailbox or exact target/source approvals. The V2 work must preserve automatic fixed wakes when enabled; the legacy placement checks and QA claims below do not establish that revised behavior.
+Design decision (2026-11-12, partially implemented): [project association is discovery metadata, not message authorization](docs/session-identity-decision.md). The required behavior is that moving a session does not revoke its mailbox or exact target/source approvals, and the V2 port preserves automatic fixed wakes when enabled. The public experiment delivers across project moves, but native cross-project `always` still prompts again. The legacy placement checks and QA claims below do not establish the revised design.
+
+The V2 entries remain experimental: the default V2 server requires our paired host, while the explicit `stock-experimental` entry uses public OpenCode 2.2.7 APIs. Neither is a supported stock release. See [V2 compatibility and remaining limits](docs/v2-port.md) and the [isolated native test procedure](docs/manual-v2-qa.md). Packaging is not finalized.
 
 ## Security model
 

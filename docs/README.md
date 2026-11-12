@@ -17,6 +17,8 @@ This directory is the project knowledge base. Keep it aligned with implemented a
 | [`licensing.md`](licensing.md) | GPL choice, dependency compatibility evidence, and redistribution limits |
 | [`releasing.md`](releasing.md) | Release-line packaging, publication gates, and the V1 → V2 transition |
 | [`dependency-exceptions.md`](dependency-exceptions.md) | Expiring, exact-scope dependency risk acceptance and its regression evidence |
+| [`v2-port.md`](v2-port.md) | Public OpenCode V2 compatibility blocker and integration status |
+| [`manual-v2-qa.md`](manual-v2-qa.md) | Explicitly isolated native V2 approval and wake probes; prerequisites and evidence limits |
 
 `README.md` at the repository root is the operator guide. If an operational example conflicts with the requirements or security invariants, the requirements and invariants take precedence.
 

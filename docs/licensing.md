@@ -6,7 +6,7 @@ Agent Bus's own code is licensed under **GPL-3.0-or-later**; the local dependenc
 
 On 2026-11-12, a read-only review inspected the workspace manifests, `bun.lock`, installed runtime dependency metadata, and available license texts. It covered 113 installed third-party runtime package/version pairs; the locked runtime closure contains 118 pairs, including five optional platform packages not installed locally. Development tools were considered separately.
 
-That inventory describes the baseline before the shared dependency-security refresh to MCP SDK 1.32.2 and direct Zod 4.6.7. The legacy OpenCode plugin still pins Zod 4.1.8. The refreshed graph needs a renewed full inventory and notice review before redistribution; the baseline counts above are not a current package-clearance claim.
+That inventory describes the baseline before the shared dependency-security refresh to MCP SDK 1.32.2 and direct Zod 4.6.7 and before the public OpenCode V2 SDK dependencies were added. The legacy OpenCode plugin still pins Zod 4.1.8. The refreshed V1 and experimental V2 graphs need a renewed full inventory and notice review before redistribution; the baseline counts above are not a current package-clearance claim. The integration's dependency-security advisory count is tracked separately in [V2 integration status](v2-port.md).
 
 | Dependencies | License / compatibility basis |
 |---|---|
