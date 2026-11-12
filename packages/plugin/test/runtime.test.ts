@@ -998,6 +998,35 @@ describe("agentbus_receive", () => {
 });
 
 describe("agentbus_search_sessions and agentbus_send", () => {
+  test.each(["", " \t\u3000 "])(
+    "empty search %j requests approval before listing up to 200 sessions",
+    async (query) => {
+      const { runtime, channels } = setup();
+      let approved = false;
+      const result = await runtime.search(
+        { query, limit: 200 },
+        context("host_empty_search", async (ask) => {
+          expect(
+            channels
+              .flatMap((channel) => channel.calls)
+              .some((request) => request.method === METHODS.SEARCH_SESSIONS),
+          ).toBe(false);
+          expect(ask.permission).toBe("agentbus_search_sessions");
+          approved = true;
+        }),
+      );
+      expect(approved).toBe(true);
+      const search = channels
+        .flatMap((channel) => channel.calls)
+        .find((request) => request.method === METHODS.SEARCH_SESSIONS);
+      expect(search?.params).toMatchObject({ query: "", limit: 200 });
+      expect(outputJson(result)).toMatchObject({
+        type: "agentbus_session_registry",
+        requestedLimit: 200,
+      });
+    },
+  );
+
   test("accepts one strictly correlated prevalidated foreground without calling the host resolver", async () => {
     let resolverCalls = 0;
     const { runtime, channels } = setup(undefined, {

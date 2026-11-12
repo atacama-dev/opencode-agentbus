@@ -172,7 +172,6 @@ export const CanonicalSearchQuerySchema = z
   .string()
   .refine(isWellFormedUnicode, "canonical query must be well-formed Unicode")
   .refine((value) => value === canonicalizeSearchQueryUnchecked(value), "query is not canonical")
-  .refine((value) => value.length > 0, "canonical query must not be empty")
   .refine((value) => !UNSAFE_TEXT_PATTERN.test(value), "canonical query contains unsafe characters")
   .refine(
     (value) => isWellFormedUnicode(value) && utf8Bytes(value) <= MAX_QUERY_BYTES,
