@@ -225,7 +225,7 @@ export const DEFAULT_SESSION_LEASE_SECONDS = 120;
 
 export const MAX_QUERY_BYTES = 512;
 export const MIN_SEARCH_LIMIT = 1;
-export const MAX_SEARCH_LIMIT = 50;
+export const MAX_SEARCH_LIMIT = 200;
 export const DEFAULT_SEARCH_LIMIT = 20;
 export const MAX_PENDING_LIST_LIMIT = 100;
 export const DEFAULT_PENDING_LIST_LIMIT = 20;
