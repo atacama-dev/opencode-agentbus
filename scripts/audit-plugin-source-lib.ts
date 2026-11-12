@@ -232,11 +232,48 @@ function directProperty(
   receiverName: string,
   property: string,
 ): boolean {
+  const current = unwrapExpression(expression);
   return (
-    ts.isPropertyAccessExpression(expression) &&
-    ts.isIdentifier(expression.expression) &&
-    expression.expression.text === receiverName &&
-    expression.name.text === property
+    ts.isPropertyAccessExpression(current) &&
+    ts.isIdentifier(current.expression) &&
+    current.expression.text === receiverName &&
+    current.name.text === property
+  );
+}
+
+function isPublicFixedWakeCall(node: ts.CallExpression, fileName: string): boolean {
+  if (!isExpectedSourceFile(fileName, "stock-v2-wake.ts") || node.arguments.length !== 1)
+    return false;
+  if (
+    !ts.isPropertyAccessExpression(node.expression) ||
+    node.expression.name.text !== "synthetic" ||
+    !directProperty(node.expression.expression, "host", "session")
+  )
+    return false;
+  const fields = exactProperties(node.arguments[0] as ts.Expression, [
+    "sessionID",
+    "id",
+    "text",
+    "delivery",
+    "resume",
+  ]);
+  if (!fields) return false;
+  const sessionID = fields.get("sessionID")?.initializer;
+  const id = fields.get("id")?.initializer;
+  const text = fields.get("text")?.initializer;
+  const delivery = fields.get("delivery")?.initializer;
+  return (
+    !!sessionID &&
+    directProperty(sessionID, "input", "sessionID") &&
+    !!id &&
+    directProperty(id, "input", "id") &&
+    !!text &&
+    ts.isStringLiteral(text) &&
+    text.text === FIXED_WAKE_INSTRUCTION &&
+    !!delivery &&
+    ts.isStringLiteral(delivery) &&
+    delivery.text === "queue" &&
+    fields.get("resume")?.initializer.kind === ts.SyntaxKind.TrueKeyword
   );
 }
 
@@ -639,6 +676,7 @@ function isStructurallyFixedWakeCall(node: ts.CallExpression): boolean {
 interface SourceAnalysis {
   readonly violations: AuditViolation[];
   readonly fixedWakeCalls: AuditViolation[];
+  readonly publicWakeCalls: AuditViolation[];
 }
 
 function analyzeSourceText(sourceText: string, fileName: string): SourceAnalysis {
@@ -655,6 +693,7 @@ function analyzeSourceText(sourceText: string, fileName: string): SourceAnalysis
   const violations: AuditViolation[] = [];
   const structurallyFixedWakeCalls = new Set<ts.CallExpression>();
   const fixedWakeCalls: AuditViolation[] = [];
+  const publicWakeCalls: AuditViolation[] = [];
 
   function collectConstants(): void {
     let changed = true;
@@ -772,6 +811,17 @@ function analyzeSourceText(sourceText: string, fileName: string): SourceAnalysis
         column: position.character + 1,
         rule: "forbidden-member",
         detail: "Only one structurally fixed Agent Bus promptAsync wake call is allowed.",
+      });
+    }
+    if (ts.isCallExpression(node) && isPublicFixedWakeCall(node, fileName)) {
+      structurallyFixedWakeCalls.add(node);
+      const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+      publicWakeCalls.push({
+        file: fileName.replaceAll("\\", "/"),
+        line: position.line + 1,
+        column: position.character + 1,
+        rule: "forbidden-member",
+        detail: "Only one fixed public V2 session.synthetic wake call is allowed.",
       });
     }
     ts.forEachChild(node, collectFixedWakeCalls);
@@ -995,7 +1045,7 @@ function analyzeSourceText(sourceText: string, fileName: string): SourceAnalysis
   }
   visit(sourceFile);
 
-  return { violations, fixedWakeCalls };
+  return { violations, fixedWakeCalls, publicWakeCalls };
 }
 
 function sortViolations(violations: AuditViolation[]): AuditViolation[] {
@@ -1011,7 +1061,11 @@ function sortViolations(violations: AuditViolation[]): AuditViolation[] {
 
 export function auditSourceText(sourceText: string, fileName: string): readonly AuditViolation[] {
   const analysis = analyzeSourceText(sourceText, fileName);
-  return sortViolations([...analysis.violations, ...analysis.fixedWakeCalls.slice(1)]);
+  return sortViolations([
+    ...analysis.violations,
+    ...analysis.fixedWakeCalls.slice(1),
+    ...analysis.publicWakeCalls.slice(1),
+  ]);
 }
 
 export function auditProductTree(productRoot: string): AuditReport {
@@ -1057,15 +1111,30 @@ export function auditProductTree(productRoot: string): AuditReport {
   walk(productRoot);
   files.sort();
   let fixedWakeCount = 0;
+  let publicWakeCount = 0;
+  let hasPublicWakeSource = false;
   for (const filePath of files) {
     const relativePath = relative(productRoot, filePath).replaceAll("\\", "/");
+    if (relativePath === "stock-v2-wake.ts") hasPublicWakeSource = true;
     const analysis = analyzeSourceText(readFileSync(filePath, "utf8"), relativePath);
     violations.push(...analysis.violations);
     for (const fixedWake of analysis.fixedWakeCalls) {
       fixedWakeCount += 1;
       if (fixedWakeCount > 1) violations.push(fixedWake);
     }
+    for (const publicWake of analysis.publicWakeCalls) {
+      publicWakeCount += 1;
+      if (publicWakeCount > 1) violations.push(publicWake);
+    }
   }
+  if (hasPublicWakeSource && publicWakeCount !== 1)
+    violations.push({
+      file: "stock-v2-wake.ts",
+      line: 1,
+      column: 1,
+      rule: "missing-fixed-wake",
+      detail: "Public V2 wake must have exactly one reviewed fixed synthetic call.",
+    });
   if (fixedWakeCount === 0) {
     violations.push({
       file: ".",
