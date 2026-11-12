@@ -8,6 +8,7 @@ This directory is the project knowledge base. Keep it aligned with implemented a
 |---|---|
 | [`requirements.md`](requirements.md) | Canonical functional and non-functional requirements |
 | [`architecture.md`](architecture.md) | Components, trust boundaries, state machines, and message flow |
+| [`session-identity-decision.md`](session-identity-decision.md) | Owner decision: project association is discovery metadata, stable session identity governs authorization, automatic wake remains required |
 | [`broker-lifecycle-decision.md`](broker-lifecycle-decision.md) | Accepted broker ownership, autostart, contention, and recovery decision |
 | [`../AGENTS.md`](../AGENTS.md) | Mandatory implementation invariants and delivery gates |
 | [`implementation-plan.md`](implementation-plan.md) | Delivery history and deterministic evaluation criteria |
