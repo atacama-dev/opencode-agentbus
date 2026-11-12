@@ -40,14 +40,17 @@ export interface SpawnedBrokerProcess {
 export interface BrokerAuthenticationInput {
   readonly config: TrustedConnectionConfig;
   readonly credential: SecureCredentialSnapshot;
+  readonly signal?: AbortSignal;
 }
 
 export interface EndpointProbeInput {
   readonly address: BrokerListenAddress;
   readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface BrokerBootstrapDependencies {
+  readonly signal?: AbortSignal;
   readonly environment?: TrustedEnvironment;
   readonly readCredential?: (
     credentialFilePath: string,
@@ -61,6 +64,7 @@ export interface BrokerBootstrapDependencies {
 }
 
 interface ResolvedBrokerBootstrapDependencies {
+  readonly signal?: AbortSignal;
   readonly environment: TrustedEnvironment;
   readonly readCredential: NonNullable<BrokerBootstrapDependencies["readCredential"]>;
   readonly authenticate: NonNullable<BrokerBootstrapDependencies["authenticate"]>;
@@ -131,6 +135,7 @@ export function launchBundledBroker(input: BundledBrokerLaunchInput): SpawnedBro
 }
 
 async function probeLoopbackEndpoint(input: EndpointProbeInput): Promise<"occupied" | "unused"> {
+  if (input.signal?.aborted) return "occupied";
   return new Promise((resolve) => {
     const socket = createConnection({ host: input.address.hostname, port: input.address.port });
     let settled = false;
@@ -138,10 +143,13 @@ async function probeLoopbackEndpoint(input: EndpointProbeInput): Promise<"occupi
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      input.signal?.removeEventListener("abort", abort);
       socket.destroy();
       resolve(result);
     };
     const timeout = setTimeout(() => finish("occupied"), input.timeoutMs);
+    const abort = () => finish("occupied");
+    input.signal?.addEventListener("abort", abort, { once: true });
     timeout.unref?.();
     socket.once("connect", () => finish("occupied"));
     socket.once("error", (error: NodeJS.ErrnoException) =>
@@ -151,12 +159,18 @@ async function probeLoopbackEndpoint(input: EndpointProbeInput): Promise<"occupi
 }
 
 function defaultAuthenticate(input: BrokerAuthenticationInput): Promise<void> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(input.signal?.reason);
+  input.signal?.addEventListener("abort", abort, { once: true });
+  if (input.signal?.aborted) abort();
   return authenticateBrokerListener({
     config: input.config,
-    controller: new AbortController(),
+    controller,
     credential: input.credential.credential,
     fetchImplementation: globalThis.fetch,
-  }).then(() => undefined);
+  })
+    .then(() => undefined)
+    .finally(() => input.signal?.removeEventListener("abort", abort));
 }
 
 export class BrokerBootstrap {
@@ -171,20 +185,39 @@ export class BrokerBootstrap {
   ) {
     this.address = endpointListenAddress(config.endpoint);
     this.dependencies = {
+      ...(dependencies.signal ? { signal: dependencies.signal } : {}),
       environment: dependencies.environment ?? process.env,
       readCredential: dependencies.readCredential ?? readCredentialFileIfPresentSecure,
       authenticate: dependencies.authenticate ?? defaultAuthenticate,
       probeEndpoint: dependencies.probeEndpoint ?? probeLoopbackEndpoint,
       launchBroker: dependencies.launchBroker ?? launchBundledBroker,
       now: dependencies.now ?? Date.now,
-      sleep: dependencies.sleep ?? ((delayMs) => Bun.sleep(delayMs)),
+      sleep:
+        dependencies.sleep ??
+        ((delayMs) =>
+          !dependencies.signal
+            ? Bun.sleep(delayMs)
+            : new Promise<void>((resolve) => {
+                const done = () => {
+                  clearTimeout(timer);
+                  dependencies.signal?.removeEventListener("abort", done);
+                  resolve();
+                };
+                const timer = setTimeout(done, delayMs);
+                timer.unref?.();
+                dependencies.signal?.addEventListener("abort", done, { once: true });
+                if (dependencies.signal?.aborted) done();
+              })),
       reportOperatorError: dependencies.reportOperatorError ?? (() => undefined),
     };
   }
 
   ensureReady(): Promise<void> {
+    if (this.dependencies.signal?.aborted) return Promise.reject(this.dependencies.signal.reason);
     if (this.work) return this.work;
     const work = this.attempt().catch((error) => {
+      if (this.dependencies.signal?.aborted && error === this.dependencies.signal.reason)
+        throw error;
       throw asSafeModelError(error);
     });
     this.work = work;
@@ -197,8 +230,10 @@ export class BrokerBootstrap {
   }
 
   private async attempt(): Promise<void> {
+    this.assertLive();
     const deadline = this.dependencies.now() + this.config.brokerStartupTimeoutMs;
     const initialAuthentication = await this.tryAuthenticate(deadline);
+    this.assertLive();
     if (initialAuthentication === "ready") return;
     if (initialAuthentication === "protocol_mismatch") this.failProtocolMismatch();
     if (!this.config.autoStartBroker) {
@@ -210,7 +245,9 @@ export class BrokerBootstrap {
     const endpointState = await this.dependencies.probeEndpoint({
       address: this.address,
       timeoutMs: remainingForProbe,
+      ...(this.dependencies.signal ? { signal: this.dependencies.signal } : {}),
     });
+    this.assertLive();
     let spawned: SpawnedBrokerProcess | undefined;
     if (endpointState === "unused" && this.config.autoStartBroker) {
       spawned = this.dependencies.launchBroker({
@@ -231,6 +268,7 @@ export class BrokerBootstrap {
             () => ({ type: "exited" as const, code: null }),
           ),
         ]);
+        this.assertLive();
         if (outcome.type === "exited") {
           const authentication = await this.tryAuthenticate(deadline);
           if (authentication === "ready") return;
@@ -244,6 +282,7 @@ export class BrokerBootstrap {
       } else {
         await this.dependencies.sleep(delayMs);
       }
+      this.assertLive();
       const authentication = await this.tryAuthenticate(deadline);
       if (authentication === "ready") return;
       if (authentication === "protocol_mismatch") this.failProtocolMismatch();
@@ -254,7 +293,9 @@ export class BrokerBootstrap {
   private async tryAuthenticate(
     deadline: number,
   ): Promise<"ready" | "unavailable" | "protocol_mismatch"> {
+    this.assertLive();
     const credential = await this.dependencies.readCredential(this.config.credentialFilePath);
+    this.assertLive();
     if (!credential) return "unavailable";
     const remaining = this.remaining(deadline);
     if (remaining <= 0) return "unavailable";
@@ -265,9 +306,12 @@ export class BrokerBootstrap {
           timeoutMs: Math.min(this.config.timeoutMs, remaining),
         },
         credential,
+        ...(this.dependencies.signal ? { signal: this.dependencies.signal } : {}),
       });
+      this.assertLive();
       return "ready";
     } catch (error) {
+      this.assertLive();
       return error instanceof BrokerProtocolMismatchError ? "protocol_mismatch" : "unavailable";
     }
   }
@@ -282,5 +326,8 @@ export class BrokerBootstrap {
 
   private remaining(deadline: number): number {
     return Math.max(0, deadline - this.dependencies.now());
+  }
+  private assertLive(): void {
+    if (this.dependencies.signal?.aborted) throw this.dependencies.signal.reason;
   }
 }
