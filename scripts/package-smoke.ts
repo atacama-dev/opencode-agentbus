@@ -451,6 +451,9 @@ try {
     mkdirSync(installedPackage, { recursive: true });
     cpSync(join(packageDirectory, "dist"), join(installedPackage, "dist"), { recursive: true });
     cpSync(join(packageDirectory, "package.json"), join(installedPackage, "package.json"));
+    if (packageName === "plugin")
+      for (const entry of ["server.js", "tui.js", "rpc.js"])
+        cpSync(join(packageDirectory, entry), join(installedPackage, entry));
   }
   for (const [specifier, source] of Object.entries({
     "@modelcontextprotocol/sdk": join(
@@ -466,6 +469,10 @@ try {
       "plugin",
     ),
     zod: join(packageDirectories.protocol, "node_modules", "zod"),
+    "@opencode/plugin": join(packageDirectories.plugin, "node_modules", "@opencode", "plugin"),
+    "@opencode/client": join(packageDirectories.plugin, "node_modules", "@opencode", "client"),
+    "@opencode/schema": join(packageDirectories.plugin, "node_modules", "@opencode", "schema"),
+    effect: join(packageDirectories.plugin, "node_modules", "effect"),
   })) {
     const destination = join(installedShapeDirectory, "node_modules", ...specifier.split("/"));
     mkdirSync(dirname(destination), { recursive: true });
@@ -484,6 +491,51 @@ try {
     throw new Error("Installed-shape plugin package must expose only its default export.");
   }
   await assertReplyCapablePlugin(installedPlugin.default as PluginFactory);
+  const installedV2 = await importBuiltModule(
+    resolvePackageExport(consumerDirectory, "@opencode-agentbus/plugin/server"),
+  );
+  const nativeDefinition = installedV2.default as
+    | { readonly id?: string; readonly setup?: unknown }
+    | undefined;
+  if (nativeDefinition?.id !== "agentbus-v2" || typeof nativeDefinition.setup !== "function")
+    throw new Error("Installed-shape native server entrypoint is invalid.");
+  // The public SDK has no verified same-host placement/invocation extension.
+  // Confirm the distributable entry fails before tool registration or broker access.
+  let nativeTools = 0;
+  const nativeError = await (nativeDefinition.setup as (ctx: unknown) => Promise<unknown>)({
+    options: {
+      deploymentNamespace: "installed-smoke",
+      endpoint: "http://127.0.0.1:1",
+      credentialFilePath: "/does/not/connect/in/package-smoke",
+      brokerDatabasePath: join(installedShapeDirectory, "stock-host-unreachable.sqlite"),
+      autoStartBroker: false,
+    },
+    tool: { transform: () => nativeTools++ },
+    permission: { assert: async () => undefined },
+  }).catch((error: unknown) => error);
+  if (
+    !(nativeError instanceof Error) ||
+    !nativeError.message.includes("paired host extensions") ||
+    nativeTools !== 0 ||
+    existsSync(join(installedShapeDirectory, "stock-host-unreachable.sqlite"))
+  )
+    throw new Error("Installed-shape V2 entry did not fail closed on a public host.");
+  const installedStock = await importBuiltModule(
+    resolvePackageExport(consumerDirectory, "@opencode-agentbus/plugin/stock-experimental"),
+  );
+  const stockDefinition = installedStock.default as
+    | { readonly id?: string; readonly effect?: unknown }
+    | undefined;
+  if (
+    stockDefinition?.id !== "agentbus-stock-experimental" ||
+    typeof stockDefinition.effect !== "function"
+  )
+    throw new Error("Installed-shape public Effect experiment is not an explicit separate entry.");
+  const installedRpc = await importBuiltModule(
+    resolvePackageExport(consumerDirectory, "@opencode-agentbus/plugin/rpc"),
+  );
+  if ((installedRpc.AGENTBUS_RPC as { readonly id?: string } | undefined)?.id !== "agentbus-v2")
+    throw new Error("Installed-shape body-free RPC entrypoint is invalid.");
   const bootstrap = (await importBuiltModule(
     join(dirname(installedPluginEntry), "broker-bootstrap.js"),
   )) as unknown as InstalledBootstrapModule;
@@ -700,5 +752,5 @@ if (Object.keys(rootManifest.scripts ?? {}).some((name) => lifecycleScripts.has(
 }
 
 console.log(
-  "Package smoke passed: protocol v2, installed broker/plugin A-to-B send, delivery, correlated reply, and return delivery.",
+  "Package smoke passed: protocol v2, installed V1 broker/plugin A-to-B send, delivery, correlated reply, return delivery; paired V2 entry fails closed on stock and separate Effect stock experiment exports.",
 );
