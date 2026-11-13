@@ -10,7 +10,7 @@ That inventory describes the baseline before the public OpenCode V2 SDK dependen
 
 | Dependencies | License / compatibility basis |
 |---|---|
-| `@modelcontextprotocol/sdk@1.30.0`, `@opencode-ai/plugin@1.18.19`, `@opencode-ai/sdk@1.18.19`, both resolved Zod versions | MIT; compatible with GPLv3 |
+| `@modelcontextprotocol/sdk@1.32.2`, `@opencode-ai/plugin@1.18.19`, `@opencode-ai/sdk@1.18.19`, both resolved Zod versions (4.6.7 and legacy-pinned 4.1.8) | MIT; compatible with GPLv3 |
 | `@ai-sdk/provider@3.0.8`, `detect-libc@2.1.2`, `kubernetes-types@1.30.0` | Apache-2.0; compatible with GPLv3, not GPLv2-only |
 | `json-schema@0.4.0` | `(AFL-2.1 OR BSD-3-Clause)`; use the BSD-3-Clause option |
 | Other inspected runtime dependencies | MIT, ISC, BSD-2-Clause, or BSD-3-Clause |
