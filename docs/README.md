@@ -12,5 +12,8 @@ This directory is the project knowledge base. Keep it aligned with implemented a
 | [`qa.md`](qa.md) | Verified acceptance evidence and remaining release gates |
 | [`manual-qa.md`](manual-qa.md) | Opt-in attached-client procedure with operator-supplied paths and service settings |
 | [`licensing.md`](licensing.md) | GPL choice, dependency compatibility evidence, and redistribution limits |
+| [`releasing.md`](releasing.md) | Release-line packaging, publication gates, and the V1 → V2 transition |
 
 `README.md` at the repository root is the operator guide. If an operational example conflicts with the requirements or security invariants, the requirements and invariants take precedence.
+
+Partly developed using [Roster](https://github.com/mathiasbourgoin/roster).
