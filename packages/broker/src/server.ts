@@ -241,7 +241,7 @@ function customRequestSchema(method: Method) {
   return z
     .object({
       method: z.literal(method),
-      params: z.record(z.unknown()),
+      params: z.record(z.string(), z.unknown()),
     })
     .passthrough();
 }

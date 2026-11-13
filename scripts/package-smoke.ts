@@ -647,18 +647,18 @@ try {
 
 const expectedDependencies: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   broker: {
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@opencode-agentbus/protocol": "workspace:0.1.0",
-    zod: "3.25.76",
+    zod: "4.6.7",
   },
   plugin: {
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@opencode-agentbus/broker": "workspace:0.1.0",
     "@opencode-agentbus/protocol": "workspace:0.1.0",
     "@opencode-ai/plugin": "1.18.19",
   },
   protocol: {
-    zod: "3.25.76",
+    zod: "4.6.7",
   },
 };
 

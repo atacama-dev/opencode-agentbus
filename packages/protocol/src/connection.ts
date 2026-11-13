@@ -45,7 +45,9 @@ export const CredentialFilePathSchema = z
 /** Trusted local plugin configuration. The path is sensitive and must never reach model context. */
 export const TrustedConnectionConfigSchema = z
   .object({
-    endpoint: LoopbackBrokerEndpointSchema.default(DEFAULT_BROKER_ENDPOINT),
+    endpoint: LoopbackBrokerEndpointSchema.default(() =>
+      LoopbackBrokerEndpointSchema.parse(DEFAULT_BROKER_ENDPOINT),
+    ),
     timeoutMs: z
       .number()
       .int()
