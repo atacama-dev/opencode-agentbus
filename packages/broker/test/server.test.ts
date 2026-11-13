@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { connect } from "node:net";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   AuthenticatedClientPrincipalSchema,
@@ -125,6 +126,443 @@ function initializeBody(id: string): string {
   });
 }
 
+test("MCP HTTP boundary rejects oversized, inconsistent and batched bodies before dispatch", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
+  try {
+    const endpoint = await daemon.start();
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const headers = {
+      Authorization: `Bearer ${credential.token}`,
+      Host: new URL(endpoint).host,
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    };
+    const invalid = async (body: string, extra: Record<string, string> = {}) =>
+      daemon.handleRequest(
+        new Request(`${endpoint}/mcp`, { method: "POST", headers: { ...headers, ...extra }, body }),
+      );
+    const secret = "never-echo-token-or-body";
+    const cases = [
+      () => invalid("x".repeat(128 * 1024 + 1)),
+      () => invalid(initializeBody(secret), { "Content-Length": "3" }),
+      () => invalid(JSON.stringify([JSON.parse(initializeBody(secret))])),
+      () => invalid(initializeBody(secret), { "Content-Length": String(128 * 1024 + 1) }),
+    ];
+    for (const send of cases) {
+      const response = await send();
+      expect([400, 413]).toContain(response.status);
+      const text = await response.text();
+      expect(text).not.toContain(secret);
+      expect(text).not.toContain(credential.token);
+      expect(daemon.connectionCounts().mcp).toBe(0);
+    }
+    let consumedChunks = 0;
+    const chunked = new Request(`${endpoint}/mcp`, {
+      method: "POST",
+      headers,
+      body: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          consumedChunks += 1;
+          controller.enqueue(new Uint8Array(64 * 1024));
+        },
+      }),
+    });
+    const chunkedResponse = await daemon.handleRequest(chunked);
+    expect(chunkedResponse.status).toBe(413);
+    // ReadableStream may prefetch one extra chunk before cancellation settles.
+    expect(consumedChunks).toBeLessThanOrEqual(4);
+    expect(daemon.connectionCounts().mcp).toBe(0);
+    const unauthorized = await daemon.handleRequest(
+      new Request(`${endpoint}/mcp`, {
+        method: "POST",
+        headers: { ...headers, Authorization: "Bearer invalid" },
+        body: "x".repeat(128 * 1024 + 1),
+      }),
+    );
+    expect(unauthorized.status).toBe(401);
+    expect(daemon.connectionCounts().mcp).toBe(0);
+    // Bun's socket-level cap may reject before the application authentication handler.
+    const overSocket = await post(endpoint, credential, "x".repeat(128 * 1024 + 1));
+    expect(overSocket.status).toBe(413);
+    expect(daemon.connectionCounts().mcp).toBe(0);
+    const healthy = await invalid(initializeBody("healthy"));
+    expect(healthy.status).toBe(200);
+    expect(healthy.headers.get("MCP-Session-Id")).toBeTruthy();
+  } finally {
+    await daemon.stop();
+    harness.close();
+  }
+});
+
+test("paused authenticated uploads reserve per-request capacity and protect existing sessions from reaping", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({
+    service: harness.service,
+    hostname: "127.0.0.1",
+    port: 0,
+    clock: harness.clock,
+    maxMcpSessionsPerPrincipal: 1,
+    maxMcpSessionsGlobal: 1,
+    mcpSessionIdleMs: 1_000,
+  });
+  try {
+    const endpoint = await daemon.start();
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const session = await initialize(endpoint, credential);
+    const headers = {
+      Authorization: `Bearer ${credential.token}`,
+      Host: new URL(endpoint).host,
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+      "MCP-Session-Id": session.sessionId,
+      "MCP-Protocol-Version": session.protocolVersion,
+    };
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const paused = daemon.handleRequest(
+      new Request(`${endpoint}/mcp`, {
+        method: "POST",
+        headers,
+        body: new ReadableStream<Uint8Array>({
+          start(value) {
+            controller = value;
+          },
+        }),
+      }),
+    );
+    const rejected = await daemon.handleRequest(
+      new Request(`${endpoint}/mcp`, {
+        method: "POST",
+        headers,
+        body: initializeBody("blocked"),
+      }),
+    );
+    expect(rejected.status).toBe(429);
+    harness.clock.advance(1_000);
+    expect(await daemon.reapIdleSessions()).toBe(0);
+    expect(daemon.connectionCounts().mcp).toBe(1);
+    controller?.enqueue(
+      new TextEncoder().encode(JSON.stringify({ jsonrpc: "2.0", id: "ping", method: "ping" })),
+    );
+    controller?.close();
+    expect((await paused).status).toBe(200);
+    expect(
+      (
+        await post(
+          endpoint,
+          credential,
+          JSON.stringify({ jsonrpc: "2.0", id: "next", method: "ping" }),
+          session,
+        )
+      ).status,
+    ).toBe(200);
+  } finally {
+    await daemon.stop();
+    harness.close();
+  }
+});
+
+test("rotation cancels a paused authenticated upload without admitting the old credential", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({
+    service: harness.service,
+    hostname: "127.0.0.1",
+    port: 0,
+    maxMcpSessionsPerPrincipal: 1,
+    maxMcpSessionsGlobal: 1,
+  });
+  try {
+    const endpoint = await daemon.start();
+    const old = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const paused = daemon.handleRequest(
+      new Request(`${endpoint}/mcp`, {
+        method: "POST",
+        headers: {
+          Host: new URL(endpoint).host,
+          Authorization: `Bearer ${old.token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: new ReadableStream<Uint8Array>({
+          start(value) {
+            controller = value;
+          },
+        }),
+      }),
+    );
+    const replacement = await daemon.rotateCredential();
+    try {
+      controller?.enqueue(new TextEncoder().encode(initializeBody("old")));
+      controller?.close();
+    } catch {
+      /* rotation cancels the reader */
+    }
+    expect((await paused).status).toBe(503);
+    expect(daemon.connectionCounts().mcp).toBe(0);
+    expect((await post(endpoint, old, initializeBody("old-again"))).status).toBe(401);
+    expect((await post(endpoint, replacement, initializeBody("new"))).status).toBe(200);
+  } finally {
+    await daemon.stop();
+    harness.close();
+  }
+});
+
+test("rotation invalidates a paused request on an existing MCP session", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({ service: harness.service, port: 0 });
+  try {
+    const endpoint = await daemon.start();
+    const old = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const session = await initialize(endpoint, old);
+    const abort = new AbortController();
+    const paused = daemon.handleRequest(
+      new Request(`${endpoint}/mcp`, {
+        method: "POST",
+        signal: abort.signal,
+        headers: {
+          Host: new URL(endpoint).host,
+          Authorization: `Bearer ${old.token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "MCP-Session-Id": session.sessionId,
+        },
+        body: new ReadableStream<Uint8Array>({ start() {} }),
+      }),
+    );
+    expect(daemon.uploadCountsForTesting().total).toBe(1);
+    const replacement = await daemon.rotateCredential();
+    expect((await paused).status).toBe(503);
+    expect(daemon.uploadCountsForTesting().total).toBe(0);
+    expect(daemon.connectionCounts().mcp).toBe(0);
+    expect((await post(endpoint, replacement, initializeBody("new-session"))).status).toBe(200);
+  } finally {
+    await daemon.stop();
+    harness.close();
+  }
+});
+
+test("upload reservation has a global ceiling, and aborted reads release all slots", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({
+    service: harness.service,
+    port: 0,
+    maxMcpSessionsPerPrincipal: 2,
+    maxMcpSessionsGlobal: 2,
+  });
+  try {
+    const endpoint = await daemon.start();
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const headers = {
+      Host: new URL(endpoint).host,
+      Authorization: `Bearer ${credential.token}`,
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    };
+    const controllers: AbortController[] = [];
+    const pending = Array.from({ length: 2 }, (_, index) => {
+      const controller = new AbortController();
+      controllers.push(controller);
+      return daemon.handleRequest(
+        new Request(`${endpoint}/mcp`, {
+          method: "POST",
+          headers,
+          signal: controller.signal,
+          body: new ReadableStream<Uint8Array>({
+            start() {},
+            // A non-cooperative producer must not hold an admission slot after abort.
+            ...(index === 0 ? { cancel: () => new Promise<void>(() => {}) } : {}),
+          }),
+        }),
+      );
+    });
+    expect(daemon.uploadCountsForTesting()).toEqual({ total: 2, byPrincipal: [2] });
+    const overflow = await daemon.handleRequest(
+      new Request(`${endpoint}/mcp`, { method: "POST", headers, body: initializeBody("overflow") }),
+    );
+    expect(overflow.status).toBe(429);
+    expect(daemon.uploadCountsForTesting().total).toBe(2);
+    for (const controller of controllers) controller.abort();
+    expect((await Promise.all(pending)).map((response) => response.status)).toEqual([408, 408]);
+    expect(daemon.uploadCountsForTesting().total).toBe(0);
+    expect((await post(endpoint, credential, initializeBody("healthy"))).status).toBe(200);
+  } finally {
+    await daemon.stop();
+    harness.close();
+  }
+});
+
+async function rawHttp(endpoint: string, wire: Uint8Array, halfClose = false): Promise<string> {
+  const port = Number(new URL(endpoint).port);
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    const chunks: Uint8Array[] = [];
+    socket.setTimeout(2_000, () => socket.destroy(new Error("Raw fixture timeout")));
+    socket.once("connect", () => {
+      if (halfClose) socket.end(wire);
+      else socket.write(wire);
+    });
+    socket.on("data", (chunk: Buffer) => {
+      chunks.push(Uint8Array.from(chunk));
+      if (chunks.reduce((length, part) => length + part.length, 0) > 32 * 1024)
+        socket.destroy(new Error("Unbounded raw response"));
+    });
+    socket.once("error", reject);
+    socket.once("close", () => {
+      const result = new Uint8Array(chunks.reduce((length, part) => length + part.length, 0));
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.length;
+      }
+      resolve(new TextDecoder().decode(result));
+    });
+  });
+}
+
+test("raw loopback HTTP rejects chunked overflow, truncation and malformed framing without breaking SDK", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({ service: harness.service, port: 0 });
+  try {
+    const endpoint = await daemon.start();
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    const prefix = `POST /mcp HTTP/1.1\r\nHost: ${new URL(endpoint).host}\r\nAuthorization: Bearer ${credential.token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nConnection: close\r\n`;
+    const secret = "never-echo-raw-body";
+    const overflow = `${prefix}Transfer-Encoding: chunked\r\n\r\n${(64 * 1024).toString(16)}\r\n${"x".repeat(64 * 1024)}\r\n${(64 * 1024 + 1).toString(16)}\r\n${"x".repeat(64 * 1024 + 1)}\r\n0\r\n\r\n`;
+    const truncated = `${prefix}Content-Length: 200\r\n\r\n${initializeBody(secret)}`;
+    const wrongLength = `${prefix}Content-Length: 3\r\n\r\n${initializeBody(secret)}`;
+    const invalidUtf8 = Uint8Array.from([
+      ...new TextEncoder().encode(`${prefix}Content-Length: 2\r\n\r\n`),
+      0xc3,
+      0x28,
+    ]);
+    const malformedJson = `${prefix}Content-Length: 3\r\n\r\n{xx`;
+    for (const [index, input] of [
+      new TextEncoder().encode(overflow),
+      new TextEncoder().encode(truncated),
+      new TextEncoder().encode(wrongLength),
+      invalidUtf8,
+      new TextEncoder().encode(malformedJson),
+    ].entries()) {
+      const text = await rawHttp(endpoint, input, index === 1);
+      for (
+        let attempt = 0;
+        attempt < 20 && daemon.uploadCountsForTesting().total > 0;
+        attempt += 1
+      ) {
+        await Bun.sleep(10);
+      }
+      if (index === 0) expect(text).toMatch(/^HTTP\/1\.1 413 /);
+      if (index === 1) expect(text).toBe(""); // Bun closes a truncated upload before an application response.
+      if (index >= 2) expect(text).toMatch(/^HTTP\/1\.1 400 /);
+      expect(text).not.toContain(credential.token);
+      expect(text).not.toContain(secret);
+      expect(daemon.uploadCountsForTesting().total).toBe(0);
+      expect(daemon.connectionCounts().mcp).toBe(0);
+    }
+    const session = await initialize(endpoint, credential);
+    expect(
+      (
+        await post(
+          endpoint,
+          credential,
+          JSON.stringify({ jsonrpc: "2.0", id: "ping-healthy", method: "ping" }),
+          session,
+        )
+      ).status,
+    ).toBe(200);
+  } finally {
+    await daemon.stop();
+    harness.close();
+  }
+});
+
+test("raw paused upload cannot exceed the per-principal capacity and disconnect restores it", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({
+    service: harness.service,
+    port: 0,
+    maxMcpSessionsPerPrincipal: 1,
+    maxMcpSessionsGlobal: 1,
+  });
+  let socket: ReturnType<typeof connect> | undefined;
+  try {
+    const endpoint = await daemon.start();
+    const credential = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    socket = connect({ host: "127.0.0.1", port: Number(new URL(endpoint).port) });
+    await new Promise<void>((resolve, reject) => {
+      socket?.once("connect", resolve);
+      socket?.once("error", reject);
+    });
+    socket.write(
+      `POST /mcp HTTP/1.1\r\nHost: ${new URL(endpoint).host}\r\nAuthorization: Bearer ${credential.token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n`,
+    );
+    for (let attempt = 0; attempt < 30 && daemon.uploadCountsForTesting().total === 0; attempt += 1)
+      await Bun.sleep(10);
+    expect(daemon.uploadCountsForTesting().total).toBe(1);
+    const capped = await post(endpoint, credential, initializeBody("capped"));
+    expect(capped.status).toBe(429);
+    expect(daemon.uploadCountsForTesting().total).toBe(1);
+    socket.destroy();
+    for (let attempt = 0; attempt < 30 && daemon.uploadCountsForTesting().total > 0; attempt += 1)
+      await Bun.sleep(10);
+    expect(daemon.uploadCountsForTesting().total).toBe(0);
+    expect((await post(endpoint, credential, initializeBody("recovered"))).status).toBe(200);
+  } finally {
+    socket?.destroy();
+    await daemon.stop();
+    harness.close();
+  }
+});
+
+test("credential rotation cancels an in-flight raw socket upload before old-token dispatch", async () => {
+  const harness = createHarness();
+  const daemon = new BrokerDaemon({ service: harness.service, port: 0 });
+  let socket: ReturnType<typeof connect> | undefined;
+  try {
+    const endpoint = await daemon.start();
+    const old = CredentialFileSchema.parse(
+      JSON.parse(readFileSync(harness.credentialFilePath, "utf8")),
+    );
+    socket = connect({ host: "127.0.0.1", port: Number(new URL(endpoint).port) });
+    await new Promise<void>((resolve, reject) => {
+      socket?.once("connect", resolve);
+      socket?.once("error", reject);
+    });
+    socket.write(
+      `POST /mcp HTTP/1.1\r\nHost: ${new URL(endpoint).host}\r\nAuthorization: Bearer ${old.token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n`,
+    );
+    for (let attempt = 0; attempt < 30 && daemon.uploadCountsForTesting().total === 0; attempt += 1)
+      await Bun.sleep(10);
+    expect(daemon.uploadCountsForTesting().total).toBe(1);
+    const fresh = await daemon.rotateCredential();
+    for (let attempt = 0; attempt < 30 && daemon.uploadCountsForTesting().total > 0; attempt += 1)
+      await Bun.sleep(10);
+    expect(daemon.uploadCountsForTesting().total).toBe(0);
+    expect(daemon.connectionCounts().mcp).toBe(0);
+    expect((await post(endpoint, old, initializeBody("old"))).status).toBe(401);
+    expect((await post(endpoint, fresh, initializeBody("new"))).status).toBe(200);
+  } finally {
+    socket?.destroy();
+    await daemon.stop();
+    harness.close();
+  }
+});
+
 function eventRequest(endpoint: string, credential: CredentialFile): Request {
   const host = new URL(endpoint).host;
   return new Request(`${endpoint}/events`, {
@@ -142,6 +580,14 @@ function testPrincipal(index: number): AuthenticatedClientPrincipal {
     principalId: `capacity-principal-${index}`,
     serverId: `capacity-server-${index}`,
   });
+}
+
+function enableSyntheticCapacityPrincipals(harness: Harness): void {
+  const original = harness.service.authenticate.bind(harness.service);
+  harness.service.authenticate = (header) => {
+    const match = /^Bearer capacity-principal-(\d+)$/.exec(header ?? "");
+    return match ? testPrincipal(Number(match[1])) : original(header);
+  };
 }
 
 interface PrivateMcpAdmission {
@@ -165,6 +611,7 @@ async function initializeForPrincipal(
       headers: {
         Accept: "application/json, text/event-stream",
         "Content-Type": "application/json",
+        Authorization: `Bearer ${principal.principalId}`,
       },
       body: initializeBody(id),
     }),
@@ -191,6 +638,7 @@ async function terminateForPrincipal(
       headers: {
         "MCP-Protocol-Version": session.protocolVersion,
         "MCP-Session-Id": session.sessionId,
+        Authorization: `Bearer ${principal.principalId}`,
       },
     }),
     principal,
@@ -529,6 +977,7 @@ describe("local MCP daemon", () => {
 
   test("accepts exactly 20 default MCP sessions per principal and releases capacity", async () => {
     harness = createHarness();
+    enableSyntheticCapacityPrincipals(harness);
     daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
     const endpoint = await daemon.start();
     const principal = testPrincipal(1);
@@ -571,6 +1020,7 @@ describe("local MCP daemon", () => {
 
   test("accepts exactly 40 default MCP sessions globally and releases capacity", async () => {
     harness = createHarness();
+    enableSyntheticCapacityPrincipals(harness);
     daemon = new BrokerDaemon({ service: harness.service, hostname: "127.0.0.1", port: 0 });
     const endpoint = await daemon.start();
     const principals = [testPrincipal(1), testPrincipal(2)];
