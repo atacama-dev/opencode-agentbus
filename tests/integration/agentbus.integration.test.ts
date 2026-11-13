@@ -1056,6 +1056,10 @@ describe("built Agent Bus production composition", () => {
 
     const originalFetch = globalThis.fetch;
     const eventRequests: Array<{ readonly cursor: string | null; readonly status: number }> = [];
+    let releaseReconnect: (() => void) | undefined;
+    const reconnectHeld = new Promise<void>((resolve) => {
+      releaseReconnect = resolve;
+    });
     globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
       const url =
         input instanceof Request ? input.url : input instanceof URL ? input.href : String(input);
@@ -1067,12 +1071,17 @@ describe("built Agent Bus production composition", () => {
       world.trace.push(first ? "sse:forced-stale" : "sse:watermark-reconnect");
       const response = await originalFetch(input, { ...init, headers });
       eventRequests.push({ cursor: headers.get("Last-Event-ID"), status: response.status });
+      if (!first) await reconnectHeld;
       return response;
     };
     try {
       hooks = await world.loadPlugin(host);
       await waitFor(() => eventRequests.length >= 2, 3_000);
+      expect(host.toasts).toEqual([]);
+      releaseReconnect?.();
+      await waitFor(() => host.toasts.length > 0);
     } finally {
+      releaseReconnect?.();
       globalThis.fetch = originalFetch;
     }
 
@@ -1192,6 +1201,10 @@ describe("built Agent Bus production composition", () => {
     const eventRequests: Array<{ readonly cursor: string | null; readonly controlled: boolean }> =
       [];
     let controlledStream: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let releaseReconnect: (() => void) | undefined;
+    const reconnectHeld = new Promise<void>((resolve) => {
+      releaseReconnect = resolve;
+    });
     globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
       const url =
         input instanceof Request ? input.url : input instanceof URL ? input.href : String(input);
@@ -1210,6 +1223,7 @@ describe("built Agent Bus production composition", () => {
         });
       }
       eventRequests.push({ cursor: headers.get("Last-Event-ID"), controlled: false });
+      await reconnectHeld;
       return originalFetch(input, init);
     };
 
@@ -1222,6 +1236,10 @@ describe("built Agent Bus production composition", () => {
           world.trace.filter((entry) => entry === `rpc:${METHODS.LIST_PENDING_MESSAGES}`).length >=
             3,
       );
+      const initialRegistry = registryMatches(
+        await eventually(() => search(hooks, host, permissions, "host_principal_a", "Principal B")),
+      );
+      expect(initialRegistry.map(({ metadata }) => metadata.title)).toEqual(["Principal B"]);
       const service = world.service;
       if (!service) throw new Error("Missing live broker service.");
       const targetResponse = service.dispatch(service.principal, {
@@ -1245,7 +1263,7 @@ describe("built Agent Bus production composition", () => {
       }
 
       controlledStream?.close();
-      await Bun.sleep(20);
+      await waitFor(() => eventRequests.length === 2);
       const racedBody = "B event committed while the principal stream is disconnected";
       const enqueueResponse = service.dispatch(service.principal, {
         protocolVersion: 2,
@@ -1259,6 +1277,7 @@ describe("built Agent Bus production composition", () => {
         },
       });
       if (!enqueueResponse.ok) throw new Error("Principal-gap enqueue failed.");
+      releaseReconnect?.();
 
       permissions.decide("agentbus_search_sessions", "once");
       await search(hooks, host, permissions, "host_principal_a", "no matching principal session");
@@ -1277,6 +1296,7 @@ describe("built Agent Bus production composition", () => {
         racedBody,
       );
     } finally {
+      releaseReconnect?.();
       globalThis.fetch = originalFetch;
     }
   });
