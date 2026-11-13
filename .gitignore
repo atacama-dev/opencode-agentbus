@@ -3,6 +3,7 @@ dist/
 coverage/
 .local/
 .agentbus-installed-smoke-*/
+/release-artifacts/
 *.log
 *.db
 *.db-shm
