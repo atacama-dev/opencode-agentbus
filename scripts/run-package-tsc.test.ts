@@ -17,7 +17,7 @@ test("a clean package build makes declared CLI entries owner-executable", () => 
     mkdirSync(join(directory, "src"));
     writeFileSync(
       join(directory, "src/cli.ts"),
-      '#!/usr/bin/env bun\nconsole.log("build fixture");\n',
+      "#!/usr/bin/env bun\nexport const fixture: boolean = true;\n",
     );
     writeFileSync(
       join(directory, "package.json"),
@@ -26,7 +26,14 @@ test("a clean package build makes declared CLI entries owner-executable", () => 
     writeFileSync(
       join(directory, "tsconfig.build.json"),
       JSON.stringify({
-        compilerOptions: { target: "ES2022", module: "ESNext", outDir: "dist", types: [] },
+        // Exercise CLI output permissions without loading unrelated browser declarations.
+        compilerOptions: {
+          target: "ES2022",
+          module: "ESNext",
+          outDir: "dist",
+          lib: ["ES2022"],
+          types: [],
+        },
         include: ["src/**/*.ts"],
       }),
     );
@@ -40,6 +47,7 @@ test("a clean package build makes declared CLI entries owner-executable", () => 
       expect(result.exitCode, result.stderr.toString()).toBe(0);
       expect(statSync(executable).mode & 0o100).toBe(0o100);
       expect(readFileSync(executable, "utf8")).toStartWith("#!/usr/bin/env bun\n");
+      expect(readFileSync(executable, "utf8")).toContain("export const fixture = true;");
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
