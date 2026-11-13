@@ -163,6 +163,13 @@ interface McpContext {
   closing: boolean;
 }
 
+interface McpUpload {
+  readonly principal: AuthenticatedClientPrincipal;
+  readonly abort: AbortController;
+  readonly done: Promise<void>;
+  release(): void;
+}
+
 interface EventConnection {
   readonly principal: AuthenticatedClientPrincipal;
   close(): void;
@@ -297,6 +304,7 @@ export class BrokerDaemon {
   private authChallengeLastRefillMs: number;
   private readonly mcpSessions = new Map<string, McpContext>();
   private readonly mcpContexts = new Set<McpContext>();
+  private readonly mcpUploads = new Set<McpUpload>();
   private readonly eventConnections = new Set<EventConnection>();
   private applicationHandshakeComplete = false;
   private listener: ReturnType<typeof Bun.serve> | undefined;
@@ -443,7 +451,9 @@ export class BrokerDaemon {
     if (this.rotating || this.stopping) throw new Error("Broker is not available for rotation.");
     this.rotating = true;
     try {
+      this.cancelMcpUploads();
       await this.closeConnections();
+      await Promise.all([...this.mcpUploads].map((upload) => upload.done));
       this.applicationHandshakeComplete = false;
       return this.service.rotateCredential();
     } finally {
@@ -454,6 +464,7 @@ export class BrokerDaemon {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.cancelMcpUploads();
     if (this.reapTimer) clearInterval(this.reapTimer);
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     this.reapTimer = undefined;
@@ -465,12 +476,26 @@ export class BrokerDaemon {
     this.listener = undefined;
     const stopped = listener?.stop(true);
     await this.closeConnections();
+    await Promise.all([...this.mcpUploads].map((upload) => upload.done));
     await stopped;
     this.service.close();
   }
 
   connectionCounts(): { readonly mcp: number; readonly sse: number } {
     return { mcp: this.mcpContexts.size, sse: this.eventConnections.size };
+  }
+
+  uploadCountsForTesting(): { readonly total: number; readonly byPrincipal: number[] } {
+    const counts = new Map<string, number>();
+    for (const { principal } of this.mcpUploads) {
+      const key = `${principal.principalId}:${principal.serverId}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return { total: this.mcpUploads.size, byPrincipal: [...counts.values()] };
+  }
+
+  private cancelMcpUploads(): void {
+    for (const upload of this.mcpUploads) upload.abort.abort();
   }
 
   authChallengeRateStateForTesting(): {
@@ -566,6 +591,24 @@ export class BrokerDaemon {
     this.authChallengeLastRefillMs = now;
   }
 
+  private mcpRequestAuthorized(
+    request: Request,
+    principal: AuthenticatedClientPrincipal,
+    upload: McpUpload | undefined,
+    context: McpContext | undefined,
+    sessionId: string | null,
+  ): boolean {
+    if (this.stopping || this.rotating || request.signal.aborted || upload?.abort.signal.aborted) {
+      return false;
+    }
+    const current = this.service.authenticate(request.headers.get("authorization"));
+    return (
+      current !== undefined &&
+      principalsEqual(current, principal) &&
+      (!context || (!context.closing && this.mcpSessions.get(sessionId ?? "") === context))
+    );
+  }
+
   private async handleMcp(
     request: Request,
     principal: AuthenticatedClientPrincipal,
@@ -573,54 +616,179 @@ export class BrokerDaemon {
     if (request.method !== MCP_HTTP_CONTRACT.method && request.method !== "DELETE") {
       return plainError(405);
     }
-    if (request.method === MCP_HTTP_CONTRACT.method) {
-      const length = request.headers.get("content-length");
-      if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_HTTP_BODY_BYTES)) {
-        return jsonRpcError(413, -32600, "Request body is too large.");
-      }
-    }
-
-    await this.reapIdleSessions();
     const sessionId = request.headers.get(MCP_INITIALIZATION_CONTRACT.sessionHeader);
-    let context: McpContext;
+    let context = sessionId ? this.mcpSessions.get(sessionId) : undefined;
+    if (
+      sessionId &&
+      (!context || context.closing || !principalsEqual(context.principal, principal))
+    ) {
+      return jsonRpcError(404, -32001, "Session not found.");
+    }
+    if (!sessionId && request.method === "DELETE") {
+      return jsonRpcError(400, -32600, "MCP session header is required.");
+    }
+    if (
+      this.mcpUploads.size >= this.maxMcpSessionsGlobal ||
+      [...this.mcpUploads].filter((upload) => principalsEqual(upload.principal, principal))
+        .length >= this.maxMcpSessionsPerPrincipal ||
+      (!context &&
+        (this.mcpContexts.size >= this.maxMcpSessionsGlobal ||
+          this.mcpCountForPrincipal(principal) >= this.maxMcpSessionsPerPrincipal))
+    ) {
+      return jsonRpcError(429, -32000, "Connection limit exceeded.");
+    }
+    let releaseUpload = () => {};
+    const upload: McpUpload = {
+      principal,
+      abort: new AbortController(),
+      done: new Promise<void>((resolve) => {
+        releaseUpload = resolve;
+      }),
+      release: () => releaseUpload(),
+    };
+    this.mcpUploads.add(upload);
+    if (context) {
+      context.inFlight += 1;
+      context.lastUsedMs = this.clock.now();
+    }
+    let markedContext = context;
     let transient = false;
-    if (sessionId) {
-      const existing = this.mcpSessions.get(sessionId);
-      if (!existing || !principalsEqual(existing.principal, principal)) {
-        return jsonRpcError(404, -32001, "Session not found.");
+    try {
+      let dispatchRequest = request;
+      if (request.method === MCP_HTTP_CONTRACT.method) {
+        const length = request.headers.get("content-length");
+        if (length !== null && (!/^\d+$/.test(length) || Number(length) > MAX_HTTP_BODY_BYTES)) {
+          return jsonRpcError(413, -32600, "Request body is too large.");
+        }
+        // The low-level SDK Server does not inherit McpServer's batch/member limits.
+        // Bound the actual stream before JSON parsing or creating an MCP context.
+        const reader = request.body?.getReader();
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        if (reader) {
+          const cancel = () => {
+            void reader.cancel().catch(() => undefined);
+          };
+          let interruptRead = () => {};
+          const interrupted = new Promise<never>((_, reject) => {
+            interruptRead = () => {
+              cancel();
+              reject(new Error("MCP read interrupted"));
+            };
+          });
+          const timer = setTimeout(() => upload.abort.abort(), 30_000);
+          timer.unref?.();
+          upload.abort.signal.addEventListener("abort", interruptRead, { once: true });
+          request.signal.addEventListener("abort", interruptRead, { once: true });
+          try {
+            while (true) {
+              if (upload.abort.signal.aborted || request.signal.aborted) {
+                return jsonRpcError(
+                  this.rotating || this.stopping ? 503 : 408,
+                  -32000,
+                  "Request interrupted.",
+                );
+              }
+              const part = await Promise.race([reader.read(), interrupted]);
+              if (upload.abort.signal.aborted || request.signal.aborted) {
+                return jsonRpcError(
+                  this.rotating || this.stopping ? 503 : 408,
+                  -32000,
+                  "Request interrupted.",
+                );
+              }
+              if (part.done) break;
+              received += part.value.byteLength;
+              if (received > MAX_HTTP_BODY_BYTES) {
+                cancel();
+                return jsonRpcError(413, -32600, "Request body is too large.");
+              }
+              chunks.push(part.value);
+            }
+          } catch {
+            if (this.rotating || this.stopping)
+              return jsonRpcError(503, -32000, "Request interrupted.");
+            if (request.signal.aborted || upload.abort.signal.aborted) {
+              return jsonRpcError(408, -32000, "Request interrupted.");
+            }
+            return jsonRpcError(400, -32700, "Parse error.");
+          } finally {
+            clearTimeout(timer);
+            upload.abort.signal.removeEventListener("abort", interruptRead);
+            request.signal.removeEventListener("abort", interruptRead);
+            reader.releaseLock();
+          }
+        }
+        if (length !== null && Number(length) !== received) {
+          return jsonRpcError(400, -32600, "Invalid request body length.");
+        }
+        const bytes = new Uint8Array(received);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        try {
+          const json: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+          if (Array.isArray(json)) {
+            return jsonRpcError(400, -32600, "JSON-RPC batches are not supported.");
+          }
+        } catch {
+          return jsonRpcError(400, -32700, "Parse error.");
+        }
+        dispatchRequest = new Request(request, { body: bytes, signal: request.signal });
       }
-      context = existing;
-    } else {
-      if (request.method === "DELETE") {
-        return jsonRpcError(400, -32600, "MCP session header is required.");
+
+      if (!this.mcpRequestAuthorized(request, principal, upload, context, sessionId)) {
+        return jsonRpcError(503, -32000, "Broker is unavailable.");
+      }
+      await this.reapIdleSessions();
+      if (!context) {
+        if (
+          this.mcpContexts.size >= this.maxMcpSessionsGlobal ||
+          this.mcpCountForPrincipal(principal) >= this.maxMcpSessionsPerPrincipal
+        ) {
+          return jsonRpcError(429, -32000, "Connection limit exceeded.");
+        }
+        transient = true;
+        context = await this.createMcpContext(principal);
+        markedContext = context;
+        context.inFlight += 1;
       }
       if (
-        this.mcpContexts.size >= this.maxMcpSessionsGlobal ||
-        this.mcpCountForPrincipal(principal) >= this.maxMcpSessionsPerPrincipal
+        !this.mcpRequestAuthorized(
+          request,
+          principal,
+          upload,
+          sessionId ? context : undefined,
+          sessionId,
+        ) ||
+        context.closing
       ) {
-        return jsonRpcError(429, -32000, "Connection limit exceeded.");
+        if (transient) await this.closeMcpContext(context);
+        return jsonRpcError(503, -32000, "Broker is unavailable.");
       }
-      transient = true;
-      context = await this.createMcpContext(principal);
-    }
-
-    context.inFlight += 1;
-    context.lastUsedMs = this.clock.now();
-    try {
-      const response = await context.transport.handleRequest(request);
-      if (transient && context.transport.sessionId === undefined) {
-        await this.closeMcpContext(context);
+      context.lastUsedMs = this.clock.now();
+      try {
+        const response = await context.transport.handleRequest(dispatchRequest);
+        if (transient && context.transport.sessionId === undefined) {
+          await this.closeMcpContext(context);
+        }
+        if (request.method === "DELETE") {
+          await this.closeMcpContext(context);
+        }
+        return withSafeHeaders(response);
+      } catch {
+        if (transient) await this.closeMcpContext(context);
+        return jsonRpcError(400, -32700, "Parse error.");
       }
-      if (request.method === "DELETE") {
-        await this.closeMcpContext(context);
-      }
-      return withSafeHeaders(response);
-    } catch {
-      if (transient) await this.closeMcpContext(context);
-      return jsonRpcError(400, -32700, "Parse error.");
     } finally {
-      context.inFlight = Math.max(0, context.inFlight - 1);
-      if (!context.closing) context.lastUsedMs = this.clock.now();
+      if (markedContext) {
+        markedContext.inFlight -= 1;
+        if (!markedContext.closing) markedContext.lastUsedMs = this.clock.now();
+      }
+      this.mcpUploads.delete(upload);
+      upload.release();
     }
   }
 

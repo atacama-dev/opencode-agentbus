@@ -50,6 +50,8 @@ See [`broker-lifecycle-decision.md`](broker-lifecycle-decision.md) for the accep
 
 ## Transport and credentials
 
+The HTTP input boundary authenticates before reading a body and reserves a finite per-principal/global in-flight request slot first, using the configured MCP ceilings. Existing sessions remain marked busy for reaping purposes during body reads. The broker caps actual streamed input at 128 KiB, checks any declared length, rejects malformed UTF-8/JSON and all JSON-RPC batches, and rechecks current credentials and lifecycle before SDK dispatch. Disconnect, stop, rotation and a 30-second read deadline cancel held reads; request slots are released on all exits. These application limits remain in place with MCP SDK 1.32.2 rather than relying on high-level SDK tool-server defaults that this low-level custom-method server does not use.
+
 - MCP Streamable HTTP binds only to literal loopback (`127.0.0.1` or `::1`); the default is `http://127.0.0.1:4097`.
 - The client performs normal MCP initialize/initialized negotiation. Custom JSON-RPC methods and envelopes are defined by `@opencode-agentbus/protocol` v2.
 - Protocol v2 is a deliberate lockstep compatibility break: strict v1 method and envelope unions cannot accept direct reply or its linkage fields. The MCP connection must complete a successful v2 application handshake before registration or any message operation. A successful handshake also marks the current authenticated principal event-ready; the separate SSE endpoint returns conflict before that point, and credential rotation clears readiness.
