@@ -234,3 +234,48 @@ test("source proof requires annotated tag, exact HEAD, clean tree and protected-
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("workflow authority remains isolated from read-only builds and PR evidence", () => {
+  const ci = readFileSync(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
+  const release = readFileSync(
+    new URL("../../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
+  expect(ci).not.toMatch(/pull_request_target|id-token: write|contents: write|secrets\./u);
+  expect(ci).not.toContain("continue-on-error");
+  expect(release).not.toContain("continue-on-error");
+  for (const workflow of [ci, release]) {
+    for (const match of workflow.matchAll(/uses: ([^\s]+)/gu))
+      expect(match[1]).toMatch(/^[\w/-]+@[a-f0-9]{40}$/u);
+    expect(workflow).toContain("bun install --frozen-lockfile --ignore-scripts");
+    expect(workflow).toContain("persist-credentials: false");
+    expect(workflow).toContain("mktemp -d /dev/shm/agentbus-tests.XXXXXX");
+    expect(workflow).toContain('test "$(stat -f -c %T /dev/shm)" = tmpfs');
+    expect(workflow).toContain("disk durability is not established");
+    expect(workflow.match(/TMPDIR: \$\{\{ steps.fixtures.outputs.root \}\}/gu)).toHaveLength(2);
+  }
+  const publication = release.slice(release.indexOf("\n  publication:"));
+  expect(publication).toContain("environment: ${{ needs.source.outputs.environment }}");
+  expect(publication).toContain("id-token: write");
+  expect(publication).toContain(
+    "group: npm-publication-${{ github.repository }}-${{ needs.source.outputs.line }}",
+  );
+  expect(publication).toContain("cancel-in-progress: false");
+  expect(publication).not.toMatch(/npm install|bun install|bun run build|npm publish|npm pack/u);
+  expect(publication).toContain("release-tested-${{ github.run_id }}");
+  expect(release).not.toContain("release-npm");
+  expect(release).not.toContain("RELEASE_NPM_CLI");
+  expect(publication.match(/uses: actions\/download-artifact@/gu)).toHaveLength(1);
+  expect(publication).toContain("RELEASE_NODE_BINARY: ${{ steps.runtime.outputs.node }}");
+  expect(publication.indexOf("id: runtime")).toBeLessThan(
+    publication.indexOf("uses: actions/download-artifact@"),
+  );
+  expect(publication).toContain("package-manager-cache: false");
+  const publisher = readFileSync(new URL("./publication.ts", import.meta.url), "utf8");
+  expect(publisher).not.toContain("RELEASE_NPM_CLI");
+  expect(publisher).not.toContain("release-npm");
+  expect(publisher).toContain("execFileSync(tools.node, [tools.npmCli");
+  expect(release.slice(0, release.indexOf("\n  publication:"))).not.toMatch(
+    /contents: write|id-token: write/u,
+  );
+});

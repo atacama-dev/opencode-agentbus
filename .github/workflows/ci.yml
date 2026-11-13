@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main, julien@release-v1, julien@opencode-v2, maintenance/opencode-v1, maintenance/opencode-v2]
+  pull_request:
+    branches: [main, julien@opencode-v2, maintenance/opencode-v1, maintenance/opencode-v2]
+  workflow_dispatch: # Evidence-only dry run; never publishes or creates refs/releases.
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    outputs:
+      lines: ${{ steps.config.outputs.lines }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - id: config
+        run: printf 'lines=%s\n' "$(bun scripts/release/policy.ts matrix)" >> "$GITHUB_OUTPUT"
+
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - run: mkdir -p /tmp/opencode
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run build
+      - name: Prepare owned tmpfs fixtures (not a disk-durability gate)
+        id: fixtures
+        run: |
+          test "$(stat -f -c %T /dev/shm)" = tmpfs
+          fixture_root="$(mktemp -d /dev/shm/agentbus-tests.XXXXXX)"
+          printf 'root=%s\n' "$fixture_root" >> "$GITHUB_OUTPUT"
+          echo 'Unit/integration fixtures use tmpfs; disk durability is not established by these tests.'
+      - run: bun run test:unit
+        env:
+          TMPDIR: ${{ steps.fixtures.outputs.root }}
+      - run: bun run test:integration
+        env:
+          TMPDIR: ${{ steps.fixtures.outputs.root }}
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun run format-check
+      - run: bun run audit:static
+      - run: bun run package-smoke
+
+  dependency-audit:
+    name: Workspace dependency audit (blocking)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun audit
+
+  archives:
+    name: Tested archive (${{ matrix.line }})
+    needs: profile
+    strategy:
+      fail-fast: false
+      matrix:
+        line: ${{ fromJSON(needs.profile.outputs.lines) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - run: mkdir -p /tmp/opencode
+      - name: Pin npm on this ephemeral runner only
+        run: |
+          npm install --prefix "$RUNNER_TEMP/release-tools" --ignore-scripts --no-audit --no-fund --package-lock=false npm@12.2.0
+          printf '%s\n' "$RUNNER_TEMP/release-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run build
+      - name: Pack the configured line
+        env:
+          RELEASE_LINE: ${{ matrix.line }}
+        run: bun scripts/release/package.ts --line "$RELEASE_LINE" --out release-artifacts
+      - name: Smoke actual installed tarball and record production audit
+        env:
+          RELEASE_LINE: ${{ matrix.line }}
+        run: bun scripts/release/smoke.ts --manifest "release-artifacts/$RELEASE_LINE/manifest.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: tested-${{ matrix.line }}
+          path: release-artifacts/${{ matrix.line }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  production-audit:
+    name: Installed production dependency audit (${{ matrix.line }}, blocking)
+    needs: [profile, archives]
+    strategy:
+      fail-fast: false
+      matrix:
+        line: ${{ fromJSON(needs.profile.outputs.lines) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          digest-mismatch: error
+          name: tested-${{ matrix.line }}
+          path: release-artifacts/${{ matrix.line }}
+      - env:
+          RELEASE_LINE: ${{ matrix.line }}
+        run: bun scripts/release/policy.ts audit "release-artifacts/$RELEASE_LINE/audit.json"

@@ -1,0 +1,194 @@
+name: Release tested archive
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Manual prerequisites: protected main and maintenance/opencode-v1|v2 branches;
+# protected annotated opencode-v1/v* and opencode-v2/v* tags; reviewed npm-v1/npm-v2
+# environments with exact allowed release tags; npm namespace ownership and trusted
+# publishers bound to THIS release.yml + corresponding environment. No token fallback.
+# This workflow never creates releases, tags or maintenance branches. Repository
+# visibility stays unchanged; our public-provenance policy blocks private sources.
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.repository == 'atacama-dev/opencode-agentbus'
+    runs-on: ubuntu-24.04
+    outputs:
+      line: ${{ steps.source.outputs.line }}
+      sourceCommit: ${{ steps.source.outputs.sourceCommit }}
+      environment: ${{ steps.source.outputs.environment }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - id: source
+        run: bun scripts/release/policy.ts source
+
+  build:
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sourceCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - run: mkdir -p /tmp/opencode
+      - name: Pin npm without lifecycle scripts (unprivileged build only)
+        run: |
+          npm install --prefix "$RUNNER_TEMP/release-tools" --ignore-scripts --no-audit --no-fund --package-lock=false npm@12.2.0
+          printf '%s\n' "$RUNNER_TEMP/release-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - run: bun scripts/release/policy.ts source
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run build
+      - name: Prepare owned tmpfs fixtures (not a disk-durability gate)
+        id: fixtures
+        run: |
+          test "$(stat -f -c %T /dev/shm)" = tmpfs
+          fixture_root="$(mktemp -d /dev/shm/agentbus-tests.XXXXXX)"
+          printf 'root=%s\n' "$fixture_root" >> "$GITHUB_OUTPUT"
+          echo 'Unit/integration fixtures use tmpfs; disk durability is not established by these tests.'
+      - run: bun run test:unit
+        env:
+          TMPDIR: ${{ steps.fixtures.outputs.root }}
+      - run: bun run test:integration
+        env:
+          TMPDIR: ${{ steps.fixtures.outputs.root }}
+      - run: bun run typecheck
+      - run: bun run lint
+      - run: bun run format-check
+      - run: bun run audit:static
+      - run: bun run package-smoke
+      - env:
+          RELEASE_LINE: ${{ needs.source.outputs.line }}
+        run: bun scripts/release/package.ts --line "$RELEASE_LINE" --out release-artifacts
+      - env:
+          RELEASE_LINE: ${{ needs.source.outputs.line }}
+        run: bun scripts/release/smoke.ts --manifest "release-artifacts/$RELEASE_LINE/manifest.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: release-tested-${{ github.run_id }}
+          path: release-artifacts/${{ needs.source.outputs.line }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  production-audit:
+    name: Installed production audit (blocks ALL release writes)
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sourceCommit }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          digest-mismatch: error
+          name: release-tested-${{ github.run_id }}
+          path: release-artifacts/${{ needs.source.outputs.line }}
+      - env:
+          RELEASE_LINE: ${{ needs.source.outputs.line }}
+        run: bun scripts/release/policy.ts audit "release-artifacts/$RELEASE_LINE/audit.json"
+
+  dependency-audit:
+    name: Workspace audit (blocking)
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sourceCommit }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun audit
+
+  authorization:
+    name: Readiness and public-provenance policy (blocking)
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sourceCommit }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - run: bun scripts/release/policy.ts authorize
+
+  publication:
+    needs: [source, build, production-audit, dependency-audit, authorization]
+    if: github.repository == 'atacama-dev/opencode-agentbus' && github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.source.outputs.environment }}
+    # Serialize this repository/line across versions. Pending jobs are not FIFO and
+    # may be superseded: retry cancelled jobs after checking current registry state.
+    # External npm administrators must coordinate; registry reads are not a CAS.
+    concurrency:
+      group: npm-publication-${{ github.repository }}-${{ needs.source.outputs.line }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      # No source build, dependency install or package lifecycle in this job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sourceCommit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Capture official Node distribution path before downloading build data
+        id: runtime
+        run: printf 'node=%s\n' "$(command -v node)" >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+          no-cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          digest-mismatch: error
+          name: release-tested-${{ github.run_id }}
+          path: release-artifacts/${{ needs.source.outputs.line }}
+      - name: Verify policy and publish exact tested bytes (OIDC only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_LINE: ${{ needs.source.outputs.line }}
+          RELEASE_SOURCE_COMMIT: ${{ needs.source.outputs.sourceCommit }}
+          RELEASE_NODE_BINARY: ${{ steps.runtime.outputs.node }}
+        run: bun scripts/release/publication.ts --manifest "release-artifacts/$RELEASE_LINE/manifest.json"
