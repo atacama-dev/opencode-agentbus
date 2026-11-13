@@ -28,6 +28,7 @@
     "broker:start": "bun run --cwd packages/broker start",
     "package-smoke": "bun scripts/package-smoke.ts",
     "release:pack": "bun scripts/release/package.ts",
+    "release:smoke": "bun scripts/release/smoke.ts",
     "audit": "bun audit && bun run audit:static",
     "audit:static": "bun scripts/audit-plugin-source.ts"
   },
