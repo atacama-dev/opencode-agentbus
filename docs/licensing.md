@@ -6,9 +6,11 @@ Agent Bus's own code is licensed under **GPL-3.0-or-later**; the local dependenc
 
 On 2026-11-12, a read-only review inspected the workspace manifests, `bun.lock`, installed runtime dependency metadata, and available license texts. It covered 113 installed third-party runtime package/version pairs; the locked runtime closure contains 118 pairs, including five optional platform packages not installed locally. Development tools were considered separately.
 
+That inventory describes the baseline before the shared dependency-security refresh to MCP SDK 1.32.2 and direct Zod 4.6.7. The legacy OpenCode plugin still pins Zod 4.1.8. The refreshed graph needs a renewed full inventory and notice review before redistribution; the baseline counts above are not a current package-clearance claim.
+
 | Dependencies | License / compatibility basis |
 |---|---|
-| `@modelcontextprotocol/sdk@1.30.0`, `@opencode-ai/plugin@1.18.19`, `@opencode-ai/sdk@1.18.19`, both resolved Zod versions | MIT; compatible with GPLv3 |
+| `@modelcontextprotocol/sdk@1.32.2`, `@opencode-ai/plugin@1.18.19`, `@opencode-ai/sdk@1.18.19`, both resolved Zod versions (4.6.7 and legacy-pinned 4.1.8) | MIT; compatible with GPLv3 |
 | `@ai-sdk/provider@3.0.8`, `detect-libc@2.1.2`, `kubernetes-types@1.30.0` | Apache-2.0; compatible with GPLv3, not GPLv2-only |
 | `json-schema@0.4.0` | `(AFL-2.1 OR BSD-3-Clause)`; use the BSD-3-Clause option |
 | Other inspected runtime dependencies | MIT, ISC, BSD-2-Clause, or BSD-3-Clause |

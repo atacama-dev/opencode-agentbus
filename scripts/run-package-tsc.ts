@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 const mode = Bun.argv[2];
@@ -36,4 +36,13 @@ if (!hasInputs) {
     stderr: "inherit",
   });
   if (!result.success) process.exitCode = result.exitCode;
+  else if (mode === "build") {
+    const manifest = JSON.parse(
+      readFileSync(resolve(packageDirectory, "package.json"), "utf8"),
+    ) as { bin?: Readonly<Record<string, string>> };
+    for (const entry of Object.values(manifest.bin ?? {})) {
+      const executable = resolve(packageDirectory, entry);
+      chmodSync(executable, statSync(executable).mode | 0o100);
+    }
+  }
 }

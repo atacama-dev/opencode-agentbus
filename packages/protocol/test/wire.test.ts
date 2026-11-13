@@ -9,6 +9,7 @@ import {
   CREDENTIAL_PROVISIONING_CONTRACT,
   CONNECTION_SECURITY_CONTRACT,
   CredentialFileSchema,
+  HandshakeRequestSchema,
   DEFAULT_ACTIVE_SESSIONS_PER_PRINCIPAL,
   DEFAULT_BROKER_ENDPOINT,
   DEFAULT_BROKER_STARTUP_TIMEOUT_MS,
@@ -34,6 +35,8 @@ import {
   PrincipalSessionBindingSchema,
   SSE_HTTP_CONTRACT,
   SessionIdentitySchema,
+  SessionMetadataSchema,
+  BodyHashSchema,
   TOKEN_ROTATION_CONTRACT,
   TrustedConnectionConfigSchema,
   bodySha256,
@@ -72,13 +75,32 @@ const request = EnqueueMessageRequestSchema.parse({
   params: { source, target, body: "hello", ttlSeconds: 60 },
 });
 
+test("patched Zod bounds collections and preserves strict wire validation", () => {
+  expect(
+    SessionMetadataSchema.safeParse({ labels: Array.from({ length: 1_024 }, () => "label") })
+      .success,
+  ).toBe(false);
+  expect(
+    HandshakeRequestSchema.safeParse({
+      protocolVersion: PROTOCOL_VERSION,
+      requestId: "request_01",
+      method: METHODS.HANDSHAKE,
+      params: { supportedProtocolVersions: Array.from({ length: 1_024 }, () => 2) },
+    }).success,
+  ).toBe(false);
+  expect(SessionIdentitySchema.safeParse({ ...source, unexpected: true }).success).toBe(false);
+  expect(BodyHashSchema.safeParse("f".repeat(64)).success).toBe(true);
+  expect(BodyHashSchema.safeParse("f".repeat(63)).success).toBe(false);
+  expect(SessionMetadataSchema.safeParse({ title: "\ud800" }).success).toBe(false);
+});
+
 describe("exact MCP Streamable HTTP mapping", () => {
   test("freezes SDK initialization, content type, session, and custom-method semantics", () => {
     expect(MCP_INITIALIZATION_CONTRACT).toEqual({
       initializeRequestMethod: "initialize",
       initializedNotificationMethod: "notifications/initialized",
       sessionHeader: "MCP-Session-Id",
-      sessionManagedBy: "@modelcontextprotocol/sdk@1.30.0",
+      sessionManagedBy: "@modelcontextprotocol/sdk@1.32.2",
     });
     expect(MCP_HTTP_CONTRACT).toEqual({
       method: "POST",

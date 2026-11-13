@@ -57,6 +57,14 @@ class CorrelatedSdkTransport implements Transport {
   }
 
   async send(message: JSONRPCMessage, options?: TransportSendOptions): Promise<void> {
+    const sdkOptions = options && {
+      ...(options.resumptionToken === undefined
+        ? {}
+        : { resumptionToken: options.resumptionToken }),
+      ...(options.onresumptiontoken === undefined
+        ? {}
+        : { onresumptiontoken: options.onresumptiontoken }),
+    };
     if (
       typeof message === "object" &&
       message !== null &&
@@ -69,10 +77,10 @@ class CorrelatedSdkTransport implements Transport {
       const sdkId = messageId(message);
       if (sdkId === undefined) throw new Error("SDK request ID is unavailable.");
       this.correlations.set(wire.id, { sdkId, request });
-      await this.inner.send(wire, options);
+      await this.inner.send(wire, sdkOptions);
       return;
     }
-    await this.inner.send(message, options);
+    await this.inner.send(message, sdkOptions);
   }
 
   async close(): Promise<void> {

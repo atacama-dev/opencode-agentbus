@@ -55,7 +55,7 @@ export const MCP_INITIALIZATION_CONTRACT = Object.freeze({
   initializeRequestMethod: "initialize",
   initializedNotificationMethod: "notifications/initialized",
   sessionHeader: "MCP-Session-Id",
-  sessionManagedBy: "@modelcontextprotocol/sdk@1.30.0",
+  sessionManagedBy: "@modelcontextprotocol/sdk@1.32.2",
 } as const);
 
 export const MCP_HTTP_CONTRACT = Object.freeze({
