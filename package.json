@@ -27,10 +27,11 @@
     "format-check": "biome format .",
     "broker:start": "bun run --cwd packages/broker start",
     "package-smoke": "bun scripts/package-smoke.ts",
+    "audit": "bun audit && bun run audit:static",
+    "audit:static": "bun scripts/audit-plugin-source.ts",
     "release:pack": "bun scripts/release/package.ts",
     "release:smoke": "bun scripts/release/smoke.ts",
-    "audit": "bun audit && bun run audit:static",
-    "audit:static": "bun scripts/audit-plugin-source.ts"
+    "release:check": "bun scripts/release/policy.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
