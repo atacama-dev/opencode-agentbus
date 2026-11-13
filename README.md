@@ -157,6 +157,8 @@ Installing the plugin for a project opts in up to 256 newest sessions returned b
 
 ## Verify
 
+Release preparation uses separate OpenCode V1/V2 package profiles and tests the actual npm archives in independent consumers. See the [release procedure](docs/releasing.md) for local commands, guarded GitHub/npm automation, and the planned V1 preservation followed by the V2 transition. Publication is disabled initially; producing a development archive is not release approval.
+
 ```bash
 bun run test
 bun run typecheck
@@ -193,3 +195,5 @@ See:
 Copyright (C) 2026 Julien Tesson <julien@atacama.tech>.
 
 OpenCode Agent Bus is free software: you can redistribute it and/or modify it under the GNU General Public License, version 3 or (at your option) any later version. It is distributed without any warranty, including the implied warranties of merchantability or fitness for a particular purpose. See [LICENSE](LICENSE) for the full terms and [dependency licensing notes](docs/licensing.md) for redistribution constraints.
+
+Partly developed using [Roster](https://github.com/mathiasbourgoin/roster).
