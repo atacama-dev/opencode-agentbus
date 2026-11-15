@@ -30,7 +30,7 @@
     "release:pack": "bun scripts/release/package.ts",
     "release:smoke": "bun scripts/release/smoke.ts",
     "release:check": "bun scripts/release/policy.ts",
-    "audit": "bun audit && bun run audit:static",
+    "audit": "bun scripts/security/workspace-audit.ts --out .local/audit-evidence/workspace && bun run audit:static",
     "audit:static": "bun scripts/audit-plugin-source.ts"
   },
   "devDependencies": {
