@@ -6,6 +6,8 @@ Original messaging flow approved on 2026-08-20. Plugin-managed broker lifecycle 
 
 ## Automated gates
 
+This section records the historical baseline, not a clean audit of the current dependencies. Current dependency findings and the temporary acceptance criteria are documented in [dependency exceptions](dependency-exceptions.md); a passing policy does not remove those findings.
+
 - 467 unit tests (2,217 assertions) passed; one wrong-owner database test was skipped because execution was non-root.
 - 27 integration scenarios (260 assertions) passed using the built plugin, production MCP SDK channel, live broker, SQLite/WAL, SSE, independent plugin clients, detached subprocesses, and a compatible simulated OpenCode host API for server-root/attached-workspace routing.
 - Strict typecheck, dependency-ordered builds, lint, format, package smoke, dependency audit, and static plugin audit passed.

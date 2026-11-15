@@ -13,7 +13,7 @@ Status: implemented and end-to-end QA-validated on Linux with Bun 1.3.9 and Open
 
 Design decision (2026-11-12, partially implemented): [project association is discovery metadata, not message authorization](docs/session-identity-decision.md). The required behavior is that moving a session does not revoke its mailbox or exact target/source approvals, and the V2 port preserves automatic fixed wakes when enabled. The public experiment delivers across project moves, but native cross-project `always` still prompts again. The legacy placement checks and QA claims below do not establish the revised design.
 
-The V2 entries remain experimental: the default V2 server requires our paired host, while the explicit `stock-experimental` entry uses public OpenCode 2.2.7 APIs. Neither is a supported stock release. See [V2 compatibility and remaining limits](docs/v2-port.md) and the [isolated native test procedure](docs/manual-v2-qa.md). Packaging is not finalized.
+The V2 entries remain experimental: the default V2 server requires our paired host, while the explicit `stock-experimental` entry uses public OpenCode 2.2.7 APIs. Neither is a supported stock release. See [V2 compatibility and remaining limits](docs/v2-port.md) and the [isolated native test procedure](docs/manual-v2-qa.md). [Installable archives and release automation](docs/releasing.md) are prepared and tested; publication remains disabled pending the separate release gates. Dependency findings remain visible under an [expiring risk-acceptance policy](docs/dependency-exceptions.md), not a clean-audit claim.
 
 ## Security model
 

@@ -16,6 +16,7 @@ This directory is the project knowledge base. Keep it aligned with implemented a
 | [`v2-port.md`](v2-port.md) | Public OpenCode V2 compatibility blocker and integration status |
 | [`manual-v2-qa.md`](manual-v2-qa.md) | Explicitly isolated native V2 approval and wake probes; prerequisites and evidence limits |
 | [`releasing.md`](releasing.md) | Package construction, guarded GitHub/npm publication, and the owner-controlled V1 → V2 rollout |
+| [`dependency-exceptions.md`](dependency-exceptions.md) | Expiring, exact-scope dependency risk acceptance and its regression evidence |
 
 `README.md` at the repository root is the operator guide. If an operational example conflicts with the requirements or security invariants, the requirements and invariants take precedence.
 

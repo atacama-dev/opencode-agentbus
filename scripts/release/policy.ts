@@ -10,6 +10,7 @@ import {
   parseReleaseTag,
   readReleaseConfig,
 } from "./config";
+import { evaluateAudit, type AuditContext } from "../security/audit";
 
 export const RELEASE_REPOSITORY = "atacama-dev/opencode-agentbus";
 
@@ -72,6 +73,29 @@ export function assertCleanAudit(value: unknown) {
     ["info", "low", "moderate", "high", "critical", "total"].some((key) => counts[key] !== 0)
   )
     throw new Error("Production install audit is missing, malformed, or contains vulnerabilities.");
+}
+
+/** Recompute from raw evidence, never trust an artifact's prior verdict. */
+export function assertAuditedArtifact(
+  manifest: PackageArtifact,
+  config: ReleaseConfig,
+  sourceCommit: string,
+  audit: unknown,
+  context: AuditContext,
+  exitCode: number,
+  ledger: unknown,
+) {
+  validateManifest(manifest, config, manifest.line, sourceCommit);
+  if (!Number.isSafeInteger(exitCode) || (exitCode !== 0 && exitCode !== 1))
+    throw new Error("Missing or invalid raw npm audit exit status");
+  const expected = {
+    line: manifest.line,
+    packageName: manifest.packageName,
+    version: manifest.version,
+    sha256: manifest.sha256,
+    sourceCommit: manifest.sourceCommit,
+  };
+  return evaluateAudit(audit, context, ledger, { expected, profile: "production", exitCode });
 }
 
 export function validateManifest(
@@ -175,7 +199,30 @@ if (import.meta.main) {
   if (command === "matrix" && args.length === 1) {
     console.log(JSON.stringify(config.supportedLines));
   } else if (command === "audit" && path && args.length === 2) {
-    assertCleanAudit(JSON.parse(readFileSync(path, "utf8")));
+    const folder = dirname(resolve(path));
+    const manifest = JSON.parse(readFileSync(path, "utf8"));
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: REPOSITORY_ROOT,
+      encoding: "utf8",
+    }).trim();
+    const decision = assertAuditedArtifact(
+      manifest,
+      config,
+      commit,
+      JSON.parse(readFileSync(resolve(folder, "audit.json"), "utf8")),
+      JSON.parse(readFileSync(resolve(folder, "audit-context.json"), "utf8")),
+      record(JSON.parse(readFileSync(resolve(folder, "audit-exit.json"), "utf8")))
+        .exitCode as number,
+      JSON.parse(readFileSync(resolve(REPOSITORY_ROOT, "security/audit-exceptions.json"), "utf8")),
+    );
+    console.log(
+      JSON.stringify({
+        status: decision.status,
+        rawAffectedPackages: decision.rawAffectedPackages,
+        rawAdvisories: decision.rawAdvisories,
+        acceptedRoutes: decision.accepted.length,
+      }),
+    );
   } else if (command === "authorize" && args.length === 1) {
     assertPublicationAllowed(config, eventFromEnvironment(config));
   } else if (command === "source" && args.length === 1) {
@@ -188,6 +235,6 @@ if (import.meta.main) {
       `line=${release.line}\nsourceCommit=${sourceCommit}\nenvironment=npm-${release.line}\n`,
     );
   } else {
-    throw new Error("Usage: policy.ts matrix | source | authorize | audit <production-audit.json>");
+    throw new Error("Usage: policy.ts matrix | source | authorize | audit <tested-manifest.json>");
   }
 }

@@ -16,6 +16,7 @@ import {
   type ReleaseLine,
 } from "./config";
 import { publicDependencies, validatePackedManifest } from "./package";
+import { evaluateAudit, installedContext } from "../security/audit";
 
 export function parseArtifact(value: unknown): PackageArtifact {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -322,7 +323,33 @@ export async function smokeArchive(manifestPath: string): Promise<void> {
     if (graph.code !== 0) throw new Error("Installed production dependency graph is invalid");
     const audit = await command(["npm", "audit", "--omit=dev", "--json"], consumer, true);
     writeFileSync(join(dirname(absolute), "audit.json"), audit.output);
+    writeFileSync(
+      join(dirname(absolute), "audit-exit.json"),
+      JSON.stringify({ exitCode: audit.code }),
+    );
     const vulnerabilities = validateAuditEvidence(audit.output, audit.code);
+    const identity = {
+      line: artifact.line,
+      packageName: artifact.packageName,
+      version: artifact.version,
+      sha256: artifact.sha256,
+      sourceCommit: artifact.sourceCommit,
+    };
+    const context = installedContext(consumer, "production", artifact.sourceCommit, identity);
+    writeFileSync(join(dirname(absolute), "audit-context.json"), JSON.stringify(context, null, 2));
+    const decision = evaluateAudit(
+      JSON.parse(audit.output),
+      context,
+      JSON.parse(readFileSync(join(REPOSITORY_ROOT, "security/audit-exceptions.json"), "utf8")),
+      { expected: identity, profile: "production", exitCode: audit.code },
+    );
+    writeFileSync(
+      join(dirname(absolute), "audit-decision.json"),
+      JSON.stringify(decision, null, 2),
+    );
+    console.log(
+      `Production audit: ${decision.rawAffectedPackages} affected packages, ${decision.rawAdvisories.length} distinct advisories; ${decision.status}`,
+    );
     const types = await typecheckConsumer(
       scratch,
       consumer,
