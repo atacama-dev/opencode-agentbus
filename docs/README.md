@@ -20,6 +20,7 @@ This directory is the project knowledge base. Keep it aligned with implemented a
 | [`v2-port.md`](v2-port.md) | Public OpenCode V2 compatibility blocker and integration status |
 | [`manual-v2-qa.md`](manual-v2-qa.md) | Explicitly isolated native V2 approval and wake probes; prerequisites and evidence limits |
 
+
 `README.md` at the repository root is the operator guide. If an operational example conflicts with the requirements or security invariants, the requirements and invariants take precedence.
 
 Partly developed using [Roster](https://github.com/mathiasbourgoin/roster).
