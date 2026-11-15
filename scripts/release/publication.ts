@@ -13,6 +13,7 @@ import {
 import {
   RELEASE_REPOSITORY,
   assertCleanAudit,
+  assertAuditedArtifact,
   assertPublicationAllowed,
   eventFromEnvironment,
   readArtifact,
@@ -21,6 +22,7 @@ import {
   validateManifest,
   verifySource,
 } from "./policy";
+import type { AuditContext } from "../security/audit";
 
 interface PublicationInput {
   config: ReleaseConfig;
@@ -29,6 +31,8 @@ interface PublicationInput {
   manifest: PackageArtifact;
   bytes: Uint8Array;
   audit: unknown;
+  auditContext?: AuditContext;
+  auditExit?: number;
   sourceCommit: string;
 }
 
@@ -162,7 +166,20 @@ function id(value: unknown): number {
 export async function publishRelease(input: PublicationInput, io: PublicationIO) {
   const release = releaseEvent(input.eventName, input.event, input.config);
   assertPublicationAllowed(input.config, release);
-  assertCleanAudit(input.audit);
+  const verifyAudit = () => {
+    if (input.auditContext !== undefined)
+      return assertAuditedArtifact(
+        input.manifest,
+        input.config,
+        input.sourceCommit,
+        input.audit,
+        input.auditContext,
+        input.auditExit as number,
+        JSON.parse(readFileSync(join(REPOSITORY_ROOT, "security/audit-exceptions.json"), "utf8")),
+      );
+    assertCleanAudit(input.audit);
+  };
+  const auditDecision = verifyAudit();
   const manifest = validateManifest(input.manifest, input.config, release.line, input.sourceCommit);
   if (sha256(input.bytes) !== manifest.sha256) throw new Error("Archive digest mismatch.");
   const integrity = `sha512-${createHash("sha512").update(input.bytes).digest("base64")}`;
@@ -184,6 +201,18 @@ export async function publishRelease(input: PublicationInput, io: PublicationIO)
       contentType: "text/plain",
     },
   ];
+  if (input.auditContext !== undefined && auditDecision !== undefined) {
+    for (const [name, value] of [
+      ["audit-context.json", input.auditContext],
+      ["audit-exit.json", { exitCode: input.auditExit }],
+      ["audit-decision.json", auditDecision],
+    ] as const)
+      assets.push({
+        name,
+        bytes: new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`),
+        contentType: "application/json",
+      });
+  }
 
   const verifyLive = async () => {
     const repository = await json(await io.github(API));
@@ -303,6 +332,7 @@ export async function publishRelease(input: PublicationInput, io: PublicationIO)
     } else if (channel.status !== 404) {
       throw new Error("Unable to establish the current npm channel; refusing publication.");
     }
+    verifyAudit();
     await io.publish([
       "publish",
       manifest.tarball,
@@ -334,6 +364,7 @@ export async function publishRelease(input: PublicationInput, io: PublicationIO)
   for (const asset of assets) {
     if (Object.hasOwn(existing, asset.name)) continue;
     await verifyLive();
+    verifyAudit();
     const response = await io.github(
       `${UPLOADS}/releases/${release.releaseId}/assets?name=${encodeURIComponent(asset.name)}`,
       {
@@ -366,6 +397,12 @@ if (import.meta.main) {
   const audit = JSON.parse(
     readFileSync(join(dirname(resolve(manifestPath)), "audit.json"), "utf8"),
   );
+  const auditContext = JSON.parse(
+    readFileSync(join(dirname(resolve(manifestPath)), "audit-context.json"), "utf8"),
+  );
+  const auditExit = record(
+    JSON.parse(readFileSync(join(dirname(resolve(manifestPath)), "audit-exit.json"), "utf8")),
+  ).exitCode as number;
   const token = process.env.GH_TOKEN;
   if (!token || process.env.NPM_TOKEN || process.env.NODE_AUTH_TOKEN)
     throw new Error("GitHub token required; long-lived npm tokens are forbidden.");
@@ -401,6 +438,8 @@ if (import.meta.main) {
       bytes: new Uint8Array(artifact.bytes),
       sourceCommit,
       audit,
+      auditContext,
+      auditExit,
     },
     {
       github: (url, init) => {
