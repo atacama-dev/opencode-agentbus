@@ -139,10 +139,10 @@ test("version probes have no ambient authority; only trusted publication gets OI
   }
 });
 
-function fixture(version = "0.1.0") {
+function fixture(version = "0.1.0", line: "v1" | "v2" = "v2") {
   const config = parseReleaseConfig({
     ...readReleaseConfig(),
-    releaseLine: "v2",
+    releaseLine: line,
     version,
     supportedLines: ["v1", "v2"],
     readiness: { v1: true, v2: true },
@@ -152,8 +152,8 @@ function fixture(version = "0.1.0") {
   const sourceCommit = "a".repeat(40);
   const manifest: PackageArtifact = {
     schemaVersion: 1,
-    line: "v2",
-    packageName: config.packageNames.v2,
+    line,
+    packageName: config.packageNames[line],
     version: config.version,
     tarball: "agentbus.tgz",
     sourceCommit,
@@ -164,7 +164,7 @@ function fixture(version = "0.1.0") {
     repository: { full_name: "atacama-dev/opencode-agentbus", private: false },
     release: {
       id: 7,
-      tag_name: `opencode-v2/v${version}`,
+      tag_name: `opencode-${line}/v${version}`,
       draft: false,
       prerelease: version.includes("-"),
     },
@@ -482,5 +482,115 @@ test("readiness, disabled publication, audit findings and digest corruption stop
     expect(state.reads).toHaveLength(0);
     expect(state.writes).toHaveLength(0);
     expect(state.publishCalls).toHaveLength(0);
+  }
+});
+
+function temporaryRiskFixture() {
+  const { input, state, io } = fixture("0.1.0", "v1");
+  const name = "zod";
+  const chain = ["@opencode-ai/plugin@1.18.19", "zod@4.1.8"];
+  const manifest = input.manifest;
+  const identity = {
+    line: manifest.line,
+    packageName: manifest.packageName,
+    version: manifest.version,
+    sha256: manifest.sha256,
+    sourceCommit: manifest.sourceCommit,
+  };
+  const report = {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      zod: {
+        name,
+        severity: "high",
+        via: [
+          {
+            url: "https://github.com/advisories/GHSA-mrhx-c7xc-m3w5",
+            name,
+            dependency: name,
+            severity: "high",
+            range: "<4.6.6",
+          },
+        ],
+        nodes: ["node_modules/zod"],
+      },
+    },
+    metadata: {
+      dependencies: { prod: 2 },
+      vulnerabilities: { info: 0, low: 0, moderate: 0, high: 1, critical: 0, total: 1 },
+    },
+  };
+  const auditContext = {
+    schemaVersion: 1 as const,
+    profile: "production" as const,
+    sourceCommit: input.sourceCommit,
+    manifest: identity,
+    nodes: [{ path: "node_modules/zod", name, version: "4.1.8", chains: [chain] }],
+  };
+  return { input: { ...input, audit: report, auditContext, auditExit: 1 }, state, io };
+}
+
+test("an expired temporary exception blocks publication before any network or registry access", async () => {
+  const { input, state, io } = temporaryRiskFixture();
+  const originalDate = globalThis.Date;
+  globalThis.Date = class extends originalDate {
+    constructor(value?: string | number) {
+      super(value ?? "2026-12-16T00:00:00.000Z");
+    }
+  } as DateConstructor;
+  try {
+    await expect(publishRelease(input, io)).rejects.toThrow("date");
+  } finally {
+    globalThis.Date = originalDate;
+  }
+  expect(state.reads).toHaveLength(0);
+  expect(state.writes).toHaveLength(0);
+  expect(state.publishCalls).toHaveLength(0);
+});
+
+test("temporary risk acceptance is rechecked at every publication write boundary", async () => {
+  const OriginalDate = globalThis.Date;
+  let clock = "2026-12-14T23:59:59.999Z";
+  globalThis.Date = class extends OriginalDate {
+    constructor(value?: string | number) {
+      super(value ?? clock);
+    }
+  } as DateConstructor;
+  try {
+    for (const boundary of ["none", "npm", "first-asset", "next-asset"]) {
+      clock = "2026-12-14T23:59:59.999Z";
+      const { input, state, io } = temporaryRiskFixture();
+      const wrapped: PublicationIO = {
+        ...io,
+        registry: async (url) => {
+          const response = await io.registry(url);
+          if (boundary === "npm" && url.endsWith("/latest")) clock = "2026-12-15T00:00:00Z";
+          return response;
+        },
+        publish: async (args) => {
+          await io.publish(args);
+          if (boundary === "first-asset") clock = "2026-12-15T00:00:00Z";
+        },
+        github: async (url, init) => {
+          const response = await io.github(url, init);
+          if (boundary === "next-asset" && init?.method === "POST") clock = "2026-12-15T00:00:00Z";
+          return response;
+        },
+      };
+      if (boundary === "none") {
+        expect(await publishRelease(input, wrapped)).toEqual({
+          alreadyPublished: false,
+          uploadedAssets: 7,
+        });
+      } else {
+        await expect(publishRelease(input, wrapped)).rejects.toThrow("date");
+      }
+      expect(state.publishCalls).toHaveLength(boundary === "npm" ? 0 : 1);
+      expect(state.writes).toHaveLength(
+        boundary === "none" ? 7 : boundary === "next-asset" ? 1 : 0,
+      );
+    }
+  } finally {
+    globalThis.Date = OriginalDate;
   }
 });

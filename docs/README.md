@@ -13,6 +13,7 @@ This directory is the project knowledge base. Keep it aligned with implemented a
 | [`manual-qa.md`](manual-qa.md) | Opt-in attached-client procedure with operator-supplied paths and service settings |
 | [`licensing.md`](licensing.md) | GPL choice, dependency compatibility evidence, and redistribution limits |
 | [`releasing.md`](releasing.md) | Release-line packaging, publication gates, and the V1 → V2 transition |
+| [`dependency-exceptions.md`](dependency-exceptions.md) | Expiring, exact-scope dependency risk acceptance and its regression evidence |
 
 `README.md` at the repository root is the operator guide. If an operational example conflicts with the requirements or security invariants, the requirements and invariants take precedence.
 
