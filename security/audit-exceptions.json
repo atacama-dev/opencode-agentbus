@@ -1,0 +1,161 @@
+{
+  "schemaVersion": 1,
+  "exceptions": [
+    {
+      "id": "GHSA-4qx8-w7c3-pj3p",
+      "severity": "high",
+      "package": "toml",
+      "acceptedOn": "2026-11-15",
+      "expiresOn": "2026-12-15",
+      "responsible": "Julien Tesson",
+      "reason": "Legacy SDK Effect installs TOML; own plugin does not parse TOML input.",
+      "evidence": [
+        "packages/plugin/test/advisory-exposure.test.ts",
+        "packages/plugin/src/plugin.ts"
+      ],
+      "scopes": [
+        {
+          "profile": "production",
+          "line": "v1",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        },
+        {
+          "profile": "workspace",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        }
+      ]
+    },
+    {
+      "id": "GHSA-9j65-hcg3-gc64",
+      "severity": "high",
+      "package": "toml",
+      "acceptedOn": "2026-11-15",
+      "expiresOn": "2026-12-15",
+      "responsible": "Julien Tesson",
+      "reason": "Legacy SDK Effect installs TOML; own plugin does not parse TOML input.",
+      "evidence": [
+        "packages/plugin/test/advisory-exposure.test.ts",
+        "packages/plugin/src/plugin.ts"
+      ],
+      "scopes": [
+        {
+          "profile": "production",
+          "line": "v1",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        },
+        {
+          "profile": "workspace",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        }
+      ]
+    },
+    {
+      "id": "GHSA-9qmh-m7c6-f92p",
+      "severity": "high",
+      "package": "toml",
+      "acceptedOn": "2026-11-15",
+      "expiresOn": "2026-12-15",
+      "responsible": "Julien Tesson",
+      "reason": "Legacy SDK Effect installs TOML; own plugin does not parse TOML input.",
+      "evidence": [
+        "packages/plugin/test/advisory-exposure.test.ts",
+        "packages/plugin/src/plugin.ts"
+      ],
+      "scopes": [
+        {
+          "profile": "production",
+          "line": "v1",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        },
+        {
+          "profile": "workspace",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        }
+      ]
+    },
+    {
+      "id": "GHSA-chp3-j5qr-2vfr",
+      "severity": "moderate",
+      "package": "effect",
+      "acceptedOn": "2026-11-15",
+      "expiresOn": "2026-12-15",
+      "responsible": "Julien Tesson",
+      "reason": "Legacy SDK installs beta Effect; own plugin does not call its Cookie API.",
+      "evidence": [
+        "packages/plugin/test/advisory-exposure.test.ts",
+        "packages/plugin/src/plugin.ts"
+      ],
+      "scopes": [
+        {
+          "profile": "production",
+          "line": "v1",
+          "version": "4.0.0-beta.83",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83"]]
+        },
+        {
+          "profile": "workspace",
+          "version": "4.0.0-beta.83",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83"]]
+        }
+      ]
+    },
+    {
+      "id": "GHSA-h895-cgqg-jf52",
+      "severity": "high",
+      "package": "toml",
+      "acceptedOn": "2026-11-15",
+      "expiresOn": "2026-12-15",
+      "responsible": "Julien Tesson",
+      "reason": "Legacy SDK Effect installs TOML; own plugin does not parse TOML input.",
+      "evidence": [
+        "packages/plugin/test/advisory-exposure.test.ts",
+        "packages/plugin/src/plugin.ts"
+      ],
+      "scopes": [
+        {
+          "profile": "production",
+          "line": "v1",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        },
+        {
+          "profile": "workspace",
+          "version": "4.3.0",
+          "chains": [["@opencode-ai/plugin@1.18.19", "effect@4.0.0-beta.83", "toml@4.3.0"]]
+        }
+      ]
+    },
+    {
+      "id": "GHSA-mrhx-c7xc-m3w5",
+      "severity": "high",
+      "package": "zod",
+      "acceptedOn": "2026-11-15",
+      "expiresOn": "2026-12-15",
+      "responsible": "Julien Tesson",
+      "reason": "Legacy SDK pins vulnerable Zod; own legacy tool arguments are scalar-only; broker/protocol use patched Zod 4.6.7.",
+      "evidence": [
+        "packages/plugin/test/advisory-exposure.test.ts",
+        "packages/plugin/src/plugin.ts"
+      ],
+      "scopes": [
+        {
+          "profile": "production",
+          "line": "v1",
+          "version": "4.1.8",
+          "chains": [["@opencode-ai/plugin@1.18.19", "zod@4.1.8"]]
+        },
+        {
+          "profile": "workspace",
+          "version": "4.1.8",
+          "chains": [["@opencode-ai/plugin@1.18.19", "zod@4.1.8"]]
+        }
+      ]
+    }
+  ]
+}
