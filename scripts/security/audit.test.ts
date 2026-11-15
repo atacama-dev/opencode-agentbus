@@ -336,7 +336,7 @@ const ranges: Record<string, string> = {
   glob: ">=9.0.0 <=14.0.1",
   minimatch: ">=7.0.0 <11.0.1",
 };
-test("workspace ledger names exactly six legacy advisories; no wildcard covers unknown IDs", () => {
+test("workspace ledger names exactly eight distinct known advisories; no wildcard covers unknown IDs", () => {
   const nodes = new Map<string, AuditContext["nodes"][number]>();
   const report: Record<string, unknown[]> = {};
   for (const entry of reviewed.exceptions) {
@@ -352,15 +352,15 @@ test("workspace ledger names exactly six legacy advisories; no wildcard covers u
       vulnerable_versions: ranges[name],
     });
   }
-  expect(reviewed.exceptions).toHaveLength(6);
+  expect(reviewed.exceptions).toHaveLength(8);
   const result = evaluateAudit(
     report,
     { schemaVersion: 1, profile: "workspace", sourceCommit: commit, nodes: [...nodes.values()] },
     reviewed,
     { now, exitCode: 1, expected: { sourceCommit: commit }, profile: "workspace" },
   );
-  expect(result.rawAdvisories).toHaveLength(6);
-  expect(result.accepted).toHaveLength(6);
+  expect(result.rawAdvisories).toHaveLength(8);
+  expect(result.accepted).toHaveLength(8);
   expect(() =>
     evaluateAudit(
       {
@@ -609,25 +609,9 @@ test("installed required peer reaches the same physical vulnerable copy through 
 
 test("npm propagation reports two SDK leaves rather than counting dependent ancestors as new advisories", () => {
   const names = ["glob", "minimatch"];
-  // Synthetic engine-only public-SDK graph; V1's committed ledger has no public-SDK exceptions.
-  const globException = ledger.exceptions.at(0);
-  if (!globException) throw new Error("Missing synthetic public exception");
-  const entries = [
-    globException,
-    {
-      ...globException,
-      id: "GHSA-g3hv-75wg-m249",
-      package: "minimatch",
-      scopes: [
-        {
-          profile: "production",
-          line: "v2",
-          version: "10.2.5",
-          chains: [["@opencode/plugin@2.2.7", "@opencode/util@2.2.7", "minimatch@10.2.5"]],
-        },
-      ],
-    },
-  ];
+  const entries = reviewed.exceptions.filter((entry: { package: string }) =>
+    names.includes(entry.package),
+  );
   const nodes = [
     {
       path: "node_modules/@opencode/plugin",
