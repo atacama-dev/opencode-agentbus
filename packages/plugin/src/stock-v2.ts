@@ -301,9 +301,23 @@ export default Plugin.define({
                 approvedPolicy = policy;
               },
             };
-            const result = await operation(args, context, route.foreground);
-            await revalidate();
-            return nativeV2Result(result);
+            const receiveToken =
+              name === "agentbus_receive" ? wake.beginReceive(invocation.sessionID) : undefined;
+            try {
+              const result = await operation(args, context, route.foreground);
+              await revalidate();
+              const native = nativeV2Result(result);
+              if (
+                receiveToken &&
+                typeof result !== "string" &&
+                result.metadata?.type === "agentbus_receive_status" &&
+                result.metadata.state === "EMPTY"
+              )
+                wake.endReceive(invocation.sessionID, receiveToken, true);
+              return native;
+            } finally {
+              if (receiveToken) wake.endReceive(invocation.sessionID, receiveToken);
+            }
           },
           catch: (error) => new Tool.Error({ message: asSafeModelError(error).message }),
         }).pipe(
@@ -359,14 +373,7 @@ export default Plugin.define({
               input,
               invocation,
               emptyInput,
-              async (_args, context, foreground) => {
-                wake?.beginReceive(context.sessionID);
-                try {
-                  return await runtime.receive(context, foreground);
-                } finally {
-                  wake?.endReceive(context.sessionID);
-                }
-              },
+              (_args, context, foreground) => runtime.receive(context, foreground),
             ),
         });
         editor.add({
