@@ -1,6 +1,6 @@
 # Release preparation and the OpenCode V1 → V2 transition
 
-This procedure keeps an installable OpenCode V1 release available while `main` later moves to OpenCode V2. It separates building a package from authorizing its distribution. **No release, tag, merge, or npm publication is performed by preparing these files.**
+V1 `0.1.0` has been published from protected tag `opencode-v1/v0.1.0` and preserved on `maintenance/opencode-v1`. This procedure keeps that released line available while preparing a separate OpenCode V2 source. It separates building a package from authorizing its distribution. **Preparing V2 does not authorize a V2 release, tag or npm publication.**
 
 The host generations called **V1/V2** here are different from Agent Bus's application protocol v2, which both adapters use.
 
@@ -10,12 +10,12 @@ The host generations called **V1/V2** here are different from Agent Bus's applic
 
 | Source state | Active release | Package | Tag example |
 |---|---|---|---|
-| Reviewed V1 preparation merged into `main`, then preserved on `maintenance/opencode-v1` | `v1` | `@atacama-dev/opencode-agentbus-v1` | `opencode-v1/v0.1.0` |
-| Reviewed V2 integration merged into `main`, then preserved on `maintenance/opencode-v2` | `v2` | `@atacama-dev/opencode-agentbus-v2` | `opencode-v2/v0.1.0` |
+| Released V1 source, preserved on `maintenance/opencode-v1` | `v1` | `@atacama-dev/opencode-agentbus-v1` | `opencode-v1/v0.1.0` |
+| V2 integration candidate; not released | `v2` | `@atacama-dev/opencode-agentbus-v2` | `opencode-v2/v0.1.0` (future only) |
 
-The npm names are **proposed configuration, not reserved or owned by this workflow**. Confirm the npm organization and package rights before enabling publication. A GitHub organization does not automatically own the matching npm scope.
+The V1 package exists on npm; the V2 name is configured but not published or reserved by this workflow. Confirm rights before enabling any new publication. A GitHub organization does not automatically own the matching npm scope.
 
-The V1 preparation is built from the existing V1 `main` source, with shared security/build corrections backported. It must not acquire V2 runtime dependencies or V2 ancestry merely to obtain packaging scripts. The V2 source can build both adapters for compatibility checks, but its active release line remains `v2`: that does not authorize a V1 release from the V2 line.
+The released V1 source was built from the V1 `main` line with shared security/build corrections backported; the protected tag does not acquire V2 runtime dependencies or V2 ancestry. The V2 source can build both adapters for compatibility checks, but its active release line remains `v2`: that does not authorize another V1 release from the V2 line. The workspace plugin package root still exports the legacy V1 adapter, and its `./server` entry is paired-host-only; these development exports do not select the public npm V2 archive entry.
 
 Each published release selects **one** package matching the active line. Branch/PR builds may produce both profiles where supported. Versions are plugin versions; `0.1.0` does not claim compatibility with OpenCode 0.1 or every release of its host generation.
 
@@ -52,44 +52,44 @@ The archive digest fixes our distributed package bytes, not every future registr
 
 Local artifacts built from a dirty checkout are development previews, not evidence that a tag contains those exact changes. The release path requires a clean, verified checkout of the annotated tag and distributes the same archive that passed its gates. Artifacts are ignored by Git.
 
-## Before the first release
+## Before any future release
 
 All of the following are owner-controlled prerequisites, not actions the workflow takes on your behalf:
 
-1. Confirm the package names and npm scope ownership. Complete any required first-package registration/bootstrap without publishing an unreviewed placeholder under the intended release version.
+1. Confirm the target package name and npm scope ownership. Complete any required first-package registration/bootstrap without publishing an unreviewed placeholder under the intended release version.
 2. Configure npm trusted publishing for this repository and the exact `release.yml` workflow filename, with the protected environment used by that release line. Follow [npm's trusted-publisher instructions](https://docs.npmjs.com/trusted-publishers/). No permanent write token belongs in the repository.
 3. Configure required review for the publication environments and protect `main`, the maintenance branches and both release-tag prefixes against unauthorized changes. **An annotated tag alone is not immutable**: repository rules must prevent moving or deleting accepted release tags.
-4. Decide when the repository becomes public. OIDC publishing itself can work from private repositories, but npm's automatic public provenance cannot. Our public-publication policy requires a public repository; preparation must not change visibility automatically.
+4. Verify the repository remains public. OIDC publishing itself can work from private repositories, but npm's automatic public provenance cannot. Our public-publication policy requires a public repository; preparation must not change visibility automatically.
 5. Resolve all uncovered production findings and complete the line-specific functional/security gates. Temporary acceptance is limited to the exact advisory/version/chain entries and dates in the reviewed exception ledger; it is not a clean dependency audit. Review the actual production install of each package separately and re-evaluate the policy at publication time.
-6. Record the reviewed version and explicitly mark the selected line ready in `release.config.json`; enable npm publication only after external setup and owner review. The initial readiness and publication switches are deliberately false.
+6. Record the reviewed version and explicitly mark the selected line ready in `release.config.json`; enable npm publication only after external setup and owner review. In the V2 integration candidate, V1 readiness is true as historical release state; V2 readiness and publication are false.
 
-The [V2 integration status](https://github.com/atacama-dev/opencode-agentbus/blob/julien%40opencode-v2/docs/v2-port.md) and [manual V2 procedure](https://github.com/atacama-dev/opencode-agentbus/blob/julien%40opencode-v2/docs/manual-v2-qa.md) are maintained on the V2 development line and record its limitations and native-host acceptance gaps. The V1 [QA record](qa.md) remains applicable to its own source; do not copy a V2 test result to qualify a V1 backport.
+The [V2 integration status](v2-port.md) and [manual V2 procedure](manual-v2-qa.md) record its limitations and native-host acceptance gaps. The V1 [QA record](qa.md) remains applicable to its own source; do not copy a V2 test result to qualify a V1 backport.
 
-## Rollout, when everything is ready
+## Historical V1 bootstrap and remaining rollout
 
 ### Initial V1 0.1.0 bootstrap
 
-The maintainer authorized the first V1 `0.1.0` publication on 2026-11-16, explicitly accepting the [deferred fresh manual native-host checks](qa.md#initial-v1-010-release-decision). V1 readiness/publication switches record that release decision, not a claim that those checks passed; V2 readiness stays false.
+The maintainer authorized and completed the first V1 `0.1.0` publication on 2026-11-16, explicitly accepting the [deferred fresh manual native-host checks](qa.md#initial-v1-010-release-decision). The V1 release-source readiness/publication switches record that historical decision, not a claim that those checks passed; V2 readiness stays false.
 
-npm requires an existing package before trusted publishing can be configured. For this first real package only, the approved bootstrap is an interactive publication of the **exact archive downloaded from a fully successful CI run on the protected annotated release tag**, with lifecycle scripts disabled. Verify its source commit, manifest, archive hash and installed-audit decision before publishing, then verify registry SHA-512 integrity. Do not publish a placeholder or use a permanent write token. This initial publication has **no OIDC provenance** and must not be described as trusted-published.
+npm required an existing package before trusted publishing could be configured. For V1's first real package only, the approved bootstrap interactively published the **exact archive downloaded from a fully successful CI run on the protected annotated release tag**, with lifecycle scripts disabled. Its source commit, manifest, archive hash and installed-audit decision were verified before publication, then registry SHA-512 integrity was verified. No placeholder was deliberately published, and no permanent npm token was added to CI. This initial publication has **no OIDC provenance** and must not be described as trusted-published.
 
-Publish the GitHub release on that same tag only after the registry integrity matches. The unchanged release workflow must recognize the existing identical npm version and attach verified assets without another npm publication; any byte mismatch stops the workflow. Configure trusted publishing when a subsequent real publication is ready, accounting for npm's two-day first-use deadline. This one-time bootstrap does not add a token fallback or relax subsequent publication checks.
+The GitHub release was published on that same tag after registry integrity matched. The historical release workflow did not finish green: its npm CLI version probe hit a double-loaded config error before publication, and the verified matching assets were recovered without another npm write. The later mainline `npmConfigPaths` fix applies to future releases only, not to the immutable V1 tag. Configure trusted publishing when a subsequent real publication is ready, accounting for npm's two-day first-use deadline. This one-time bootstrap does not add a token fallback or relax subsequent publication checks.
 
-### 1. Release V1 from `main`
+### 1. V1 release from `main` (completed)
 
-Integrate and review the main-based V1 preparation first. Check that its release line is `v1`, its package name and version are correct, and its gates pass on that exact source.
+The main-based V1 preparation was reviewed with release line `v1`, exact package name and version, and tagged-source gates. Its protected release commit remains immutable.
 
-Create and push an **annotated** `opencode-v1/v<version>` tag on the reviewed commit. In GitHub, publish a release selecting that existing tag. Mark a semantic prerelease such as `0.1.0-beta.1` as a GitHub prerelease; it maps to npm `next`. A final version maps to npm `latest`.
+An **annotated** `opencode-v1/v0.1.0` tag and a GitHub release select that reviewed commit. The final version maps to npm `latest`; a future semantic prerelease would instead map to `next`.
 
 The workflow builds/verifies the tagged source, not whatever `main` happens to contain later. It must confirm the tag's commit belongs to the approved source line and that the archive name/version/digest match before external writes. It does not create extra release tags or branches.
 
-### 2. Preserve V1
+### 2. Preserve V1 (completed)
 
-After the V1 release is accepted, create `maintenance/opencode-v1` at that release's commit. Keep the annotated release tag. This branch is where any later V1 fixes are reviewed; its active release line remains `v1`.
+The protected tag retains the exact V1 release commit. `maintenance/opencode-v1` preserves the final V1 source tree, including the later logo and npm-config publication correction; its active release line remains `v1`. Subsequent V1 fixes belong on this branch, without changing the accepted release tag or importing V2 runtime dependencies.
 
-### 3. Integrate V2 into `main`
+### 3. Integrate V2 into `main` (pending review)
 
-Prepare a reviewed integration against the then-current `main`, including its V1 release preparation and security backports. Do not blindly merge duplicated backports or rewrite an already-published branch history. Resolve the release configuration deliberately: `main` now selects `v2` and the V2 package, without changing the frozen V1 tag.
+Review the integration candidate against the V1-released `main`, including its shared security/build backports. Do not blindly merge duplicated backports or rewrite an already-published branch history. Only after that review and merge will `main` select `v2` and the V2 package; the frozen V1 tag remains unchanged.
 
 ### 4. Release and preserve V2
 
