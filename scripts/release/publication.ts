@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
@@ -40,6 +40,7 @@ export interface PublicationIO {
   github(url: string, init?: RequestInit): Promise<Response>;
   registry(url: string): Promise<Response>;
   publish(args: readonly string[]): Promise<void>;
+  npmConfigDir: string;
 }
 
 const API = `https://api.github.com/repos/${RELEASE_REPOSITORY}`;
@@ -110,6 +111,19 @@ export function trustedRuntimePaths(toolCache: string, node: string) {
   return { node, npmCli: join(dirname(node), "../lib/node_modules/npm/bin/npm-cli.js") };
 }
 
+function npmConfigPaths(cwd: string) {
+  return { user: "/dev/null", global: join(cwd, ".npmrc-global") };
+}
+
+export function npmConfigArgs(cwd: string): [string, string] {
+  const config = npmConfigPaths(cwd);
+  return [`--userconfig=${config.user}`, `--globalconfig=${config.global}`];
+}
+
+export function prepareNpmConfig(cwd: string) {
+  writeFileSync(npmConfigPaths(cwd).global, "", { flag: "wx", mode: 0o600 });
+}
+
 /** Version probes get no credentials; only the real publish receives short-lived OIDC authority. */
 export function npmEnvironment(
   source: NodeJS.ProcessEnv,
@@ -117,10 +131,13 @@ export function npmEnvironment(
   cwd: string,
   publish: boolean,
 ): NodeJS.ProcessEnv {
+  const config = npmConfigPaths(cwd);
   const env: NodeJS.ProcessEnv = {
     PATH: `${dirname(node)}:/usr/bin:/bin`,
     HOME: cwd,
     npm_config_cache: join(cwd, ".npm-cache"),
+    NPM_CONFIG_USERCONFIG: config.user,
+    NPM_CONFIG_GLOBALCONFIG: config.global,
     CI: "true",
   };
   for (const key of [
@@ -343,8 +360,7 @@ export async function publishRelease(input: PublicationInput, io: PublicationIO)
       release.npmTag,
       "--provenance",
       "--registry=https://registry.npmjs.org",
-      "--userconfig=/dev/null",
-      "--globalconfig=/dev/null",
+      ...npmConfigArgs(io.npmConfigDir),
     ]);
     const published = await json(
       await io.registry(
@@ -415,6 +431,7 @@ if (import.meta.main) {
       throw new Error("Trusted Node/npm files must be regular, canonical tool-cache files.");
   }
   const cwd = mkdtempSync(join(process.env.RUNNER_TEMP ?? tmpdir(), "agentbus-publish-"));
+  prepareNpmConfig(cwd);
   const probeOptions = {
     cwd,
     env: npmEnvironment(process.env, tools.node, cwd, false),
@@ -425,7 +442,7 @@ if (import.meta.main) {
     execFileSync(tools.node, ["--version"], probeOptions).trim(),
     execFileSync(
       tools.node,
-      [tools.npmCli, "--version", "--userconfig=/dev/null", "--globalconfig=/dev/null"],
+      [tools.npmCli, "--version", ...npmConfigArgs(cwd)],
       probeOptions,
     ).trim(),
   );
@@ -442,6 +459,7 @@ if (import.meta.main) {
       auditExit,
     },
     {
+      npmConfigDir: cwd,
       github: (url, init) => {
         if (!url.startsWith(`${API}/`) && url !== API && !url.startsWith(`${UPLOADS}/`))
           throw new Error("Unexpected GitHub endpoint.");
