@@ -1,5 +1,9 @@
 # OpenCode Agent Bus
 
+<p align="center">
+  <img src="assets/icon.svg" width="192" height="192" alt="Agent Bus: three connected AI agents in a mint-green bus" />
+</p>
+
 Secure, local inter-session messaging using the locked OpenCode 1.18.19 plugin API contract.
 
 The system combines:

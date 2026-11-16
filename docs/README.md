@@ -1,5 +1,7 @@
 # Knowledge base
 
+<img src="../assets/icon.svg" width="96" height="96" alt="OpenCode Agent Bus project icon" />
+
 This directory is the project knowledge base. Keep it aligned with implemented and verified behavior.
 
 | Document | Authority |
