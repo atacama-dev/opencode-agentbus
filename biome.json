@@ -6,6 +6,7 @@
       "**/dist/**",
       "**/coverage/**",
       "**/node_modules/**",
+      "release-artifacts/**",
       "scripts/fixtures/**",
       ".local/**"
     ]

@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
-import { readReleaseConfig } from "./config";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { REPOSITORY_ROOT, readReleaseConfig } from "./config";
 import {
   assertPackageLine,
   assertDeclaredBundleImports,
@@ -14,6 +16,11 @@ test("supported lines are selected without readiness or publication approval", (
   expect(assertPackageLine({ ...config, supportedLines: ["v1", "v2"] }, "v2")).toBe("v2");
   expect(() => assertPackageLine({ ...config, supportedLines: ["v1"] }, "v2")).toThrow();
   expect(() => assertPackageLine(config, "../v1")).toThrow();
+});
+
+test("generated release audit evidence is excluded from source formatting", () => {
+  const config = JSON.parse(readFileSync(resolve(REPOSITORY_ROOT, "biome.json"), "utf8"));
+  expect(config.files.ignore).toContain("release-artifacts/**");
 });
 
 test("bundle import scan rejects undeclared bare static imports and literal dynamic imports", () => {
