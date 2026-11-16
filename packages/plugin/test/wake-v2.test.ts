@@ -183,8 +183,8 @@ test("receive remains latched through rejection until authoritative empty; activ
   });
   for (let i = 0; i < 8; i++) await episodes.update("ses_one", 1);
   expect(calls).toBe(3);
-  episodes.beginReceive("ses_one");
-  episodes.endReceive("ses_one");
+  const receiving = episodes.beginReceive("ses_one");
+  episodes.endReceive("ses_one", receiving);
   idle = true;
   episodes.refreshActivity("ses_one");
   await episodes.update("ses_one", 1);
@@ -192,6 +192,199 @@ test("receive remains latched through rejection until authoritative empty; activ
   await episodes.update("ses_one", 0);
   await episodes.update("ses_one", 1);
   expect(admissions).toBe(1);
+});
+
+test("trusted empty receive rearms a zero-count latch without rewriting pending counts", async () => {
+  const state = new Map<string, unknown>();
+  let admissions = 0;
+  const episodes = new V2WakeEpisodes({
+    namespace: "empty-rearm",
+    enabled: true,
+    storage: {
+      get: async (key) => state.get(key),
+      set: async (key, value) => {
+        state.set(key, value);
+      },
+    },
+    createID: () => "msg_empty_rearm",
+    activity: async () => [],
+    resolve: async () => true,
+    admit: async (input) => {
+      admissions++;
+      return {
+        id: input.id,
+        sessionID: input.sessionID,
+        type: "synthetic",
+        delivery: "queue",
+        payload: { text: FIXED_V2_WAKE_TEXT },
+      };
+    },
+  });
+  try {
+    episodes.beginReceive("ses_empty_rearm");
+    await episodes.update("ses_empty_rearm", 0);
+    const receiving = episodes.beginReceive("ses_empty_rearm");
+    episodes.endReceive("ses_empty_rearm", receiving, true);
+    await episodes.update("ses_empty_rearm", 1);
+    expect(admissions).toBe(1);
+  } finally {
+    episodes.dispose();
+  }
+});
+
+test("empty receive racing a newer positive observation wakes without replacing its count", async () => {
+  const state = new Map<string, unknown>();
+  const admitted = Promise.withResolvers<void>();
+  let admissions = 0;
+  const episodes = new V2WakeEpisodes({
+    namespace: "empty-race",
+    enabled: true,
+    storage: {
+      get: async (key) => state.get(key),
+      set: async (key, value) => {
+        state.set(key, value);
+        if (value.state === "admitted") admitted.resolve();
+      },
+    },
+    createID: () => "msg_empty_race",
+    activity: async () => [],
+    resolve: async () => true,
+    admit: async (input) => {
+      admissions++;
+      return {
+        id: input.id,
+        sessionID: input.sessionID,
+        type: "synthetic",
+        delivery: "queue",
+        payload: { text: FIXED_V2_WAKE_TEXT },
+      };
+    },
+  });
+  try {
+    episodes.beginReceive("ses_empty_race");
+    await episodes.update("ses_empty_race", 0);
+    const receiving = episodes.beginReceive("ses_empty_race");
+    await episodes.update("ses_empty_race", 1);
+    expect(admissions).toBe(0);
+    episodes.endReceive("ses_empty_race", receiving, true);
+    await Promise.race([
+      admitted.promise,
+      Bun.sleep(100).then(() => {
+        throw new Error("new pending count was not woken after empty receive");
+      }),
+    ]);
+    expect(admissions).toBe(1);
+    expect(state.get("agentbus/episodes/v1/empty-race/ses_empty_race")).toMatchObject({
+      state: "admitted",
+    });
+  } finally {
+    episodes.dispose();
+  }
+});
+
+test("an older EMPTY acknowledgement cannot release a newer receive's latch", async () => {
+  const state = new Map<string, unknown>();
+  let admissions = 0;
+  const episodes = new V2WakeEpisodes({
+    namespace: "overlapping-receives",
+    enabled: true,
+    storage: {
+      get: async (key) => state.get(key),
+      set: async (key, value) => {
+        state.set(key, value);
+      },
+    },
+    createID: () => "msg_overlap",
+    activity: async () => [],
+    resolve: async () => true,
+    admit: async (input) => {
+      admissions++;
+      return {
+        id: input.id,
+        sessionID: input.sessionID,
+        type: "synthetic",
+        delivery: "queue",
+        payload: { text: FIXED_V2_WAKE_TEXT },
+      };
+    },
+  });
+  try {
+    const first = episodes.beginReceive("ses_overlap");
+    const second = episodes.beginReceive("ses_overlap");
+    await episodes.update("ses_overlap", 1);
+    expect(admissions).toBe(0);
+    episodes.endReceive("ses_overlap", first, true);
+    await episodes.update("ses_overlap", 1);
+    expect(admissions).toBe(0);
+    episodes.endReceive("ses_overlap", second); // a denied receive is still latched
+    await episodes.update("ses_overlap", 1);
+    expect(admissions).toBe(0);
+    episodes.endReceive("ses_overlap", second, true);
+    await episodes.update("ses_overlap", 1);
+    expect(admissions).toBe(1);
+  } finally {
+    episodes.dispose();
+  }
+});
+
+test("a delayed zero observation cannot clear a receive started after that observation", async () => {
+  const state = new Map<string, unknown>();
+  const enteredZeroGet = Promise.withResolvers<void>();
+  const releaseZeroGet = Promise.withResolvers<void>();
+  let firstGet = true;
+  let admissions = 0;
+  const episodes = new V2WakeEpisodes({
+    namespace: "delayed-zero",
+    enabled: true,
+    storage: {
+      get: async (key) => {
+        if (firstGet) {
+          firstGet = false;
+          enteredZeroGet.resolve();
+          await releaseZeroGet.promise;
+        }
+        return state.get(key);
+      },
+      set: async (key, value) => {
+        state.set(key, value);
+      },
+    },
+    createID: () => "msg_delayed_zero",
+    activity: async () => [],
+    resolve: async () => true,
+    admit: async (input) => {
+      admissions++;
+      return {
+        id: input.id,
+        sessionID: input.sessionID,
+        type: "synthetic",
+        delivery: "queue",
+        payload: { text: FIXED_V2_WAKE_TEXT },
+      };
+    },
+  });
+  let zero: Promise<void> | undefined;
+  let positive: Promise<void> | undefined;
+  try {
+    episodes.beginReceive("ses_delayed_zero");
+    zero = episodes.update("ses_delayed_zero", 0);
+    await enteredZeroGet.promise;
+    const current = episodes.beginReceive("ses_delayed_zero");
+    positive = episodes.update("ses_delayed_zero", 1);
+    releaseZeroGet.resolve();
+    await Promise.all([zero, positive]);
+    expect(admissions).toBe(0);
+    episodes.endReceive("ses_delayed_zero", current);
+    await episodes.update("ses_delayed_zero", 1);
+    expect(admissions).toBe(0);
+    episodes.endReceive("ses_delayed_zero", current, true);
+    await episodes.update("ses_delayed_zero", 1);
+    expect(admissions).toBe(1);
+  } finally {
+    releaseZeroGet.resolve();
+    await Promise.allSettled([zero, positive]);
+    episodes.dispose();
+  }
 });
 
 for (const state of ["unknown", "projected", "pending"] as const) {

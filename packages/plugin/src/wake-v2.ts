@@ -49,18 +49,25 @@ export interface WakeOptions {
 }
 export class V2WakeEpisodes {
   private readonly work = new Map<string, Promise<void>>();
-  private readonly receiving = new Set<string>();
+  private readonly receiving = new Map<string, symbol>();
   private readonly attempts = new Map<string, number>();
   private readonly counts = new Map<string, number>();
   private readonly sessions = new Map<string, AbortController>();
   private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private disposed = false;
   constructor(readonly options: WakeOptions) {}
-  beginReceive(sessionID: string): void {
-    this.receiving.add(sessionID);
+  beginReceive(sessionID: string): symbol {
+    const token = Symbol();
+    this.receiving.set(sessionID, token);
+    return token;
   }
-  endReceive(_sessionID: string): void {
-    /* latch remains until authoritative empty */
+  endReceive(sessionID: string, token?: symbol, empty = false): void {
+    if (!empty || token === undefined || this.receiving.get(sessionID) !== token) return;
+    this.receiving.delete(sessionID);
+    // The broker's empty result may race a newer pending observation. Do not
+    // publish a stale zero or close a wake admitted for that newer arrival.
+    const count = this.counts.get(sessionID);
+    if (count !== undefined && count > 0) void this.update(sessionID, count).catch(() => undefined);
   }
   refreshActivity(sessionID: string): void {
     this.attempts.delete(sessionID);
@@ -102,9 +109,10 @@ export class V2WakeEpisodes {
     }
     if (this.counts.get(sessionID) !== count) this.attempts.delete(sessionID);
     this.counts.set(sessionID, count);
+    const receiveAtObservation = this.receiving.get(sessionID);
     const work = previous
       .catch(() => undefined)
-      .then(() => this.apply(sessionID, count, controller));
+      .then(() => this.apply(sessionID, count, controller, receiveAtObservation));
     this.work.set(sessionID, work);
     try {
       await work;
@@ -116,6 +124,7 @@ export class V2WakeEpisodes {
     sessionID: string,
     count: number,
     controller: AbortController,
+    receiveAtObservation: symbol | undefined,
   ): Promise<void> {
     const current = () =>
       !this.disposed && !controller.signal.aborted && this.sessions.get(sessionID) === controller;
@@ -130,7 +139,7 @@ export class V2WakeEpisodes {
       const retry = this.retryTimers.get(sessionID);
       if (retry) clearTimeout(retry);
       this.retryTimers.delete(sessionID);
-      this.receiving.delete(sessionID);
+      if (this.receiving.get(sessionID) === receiveAtObservation) this.receiving.delete(sessionID);
       if (episode && episode.state === "admitted")
         await this.options.storage.set(key, { ...episode, state: "closed" });
       return;
