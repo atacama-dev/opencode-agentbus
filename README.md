@@ -4,7 +4,7 @@
   <img src="assets/icon.svg" width="192" height="192" alt="Agent Bus: three connected AI agents in a mint-green bus" />
 </p>
 
-Secure, local inter-session messaging using the locked OpenCode 1.18.19 plugin API contract.
+Secure, local inter-session messaging for OpenCode. V1 is released; this source line prepares an experimental stock OpenCode V2 adapter alongside the legacy development entries.
 
 The system combines:
 
@@ -13,9 +13,9 @@ The system combines:
 - sender-scoped native OpenCode approvals for message receipt;
 - tool-result delivery so peer content is never inserted as a user message.
 
-Status: implemented and end-to-end QA-validated on Linux with Bun 1.3.9 and OpenCode 1.18.19. Built integration tests cover server-root/attached-workspace behavior through a simulated OpenCode host API, and compatibility tests cover the session-status map shape observed on the currently installed OpenCode 1.18.23 runtime. The opt-in real `opencode-server` attached-client wake, TUI navigation, and approval-flow gate remains outstanding.
+V1 evidence: historical end-to-end QA on Linux with Bun 1.3.9 and OpenCode 1.18.19, built integration tests using a simulated host API, and sparse session-status compatibility observed on OpenCode 1.18.23. These are not native stock V2 acceptance results; the detailed evidence and remaining gates are recorded in [QA evidence](docs/qa.md).
 
-V1 `0.1.0` was released from the protected V1 tag and remains on `maintenance/opencode-v1`. Its one-time interactive npm bootstrap did not carry OIDC provenance; the maintainer accepted deferring fresh manual native-host acceptance, not certifying those checks. See the [release history](docs/releasing.md) and [QA evidence](docs/qa.md#initial-v1-010-release-decision).
+V1 `0.1.0` was released from the protected V1 tag and remains on `maintenance/opencode-v1`. See the [release history](docs/releasing.md); its historical evidence is separate from the V2 experiment below.
 
 Design decision (2026-11-12, partially implemented): [project association is discovery metadata, not message authorization](docs/session-identity-decision.md). The required behavior is that moving a session does not revoke its mailbox or exact target/source approvals, and the V2 port preserves automatic fixed wakes when enabled. The public experiment delivers across project moves, but native cross-project `always` still prompts again. The legacy placement checks and QA claims below do not establish the revised design.
 
@@ -30,8 +30,8 @@ The V2 entries remain experimental: the default V2 server requires our paired ho
 - Received content is returned as `trust: "untrusted"` tool output, never injected as a user or synthetic message.
 - Arrival notifications contain only a fixed pending count and do not themselves wake the model. A separate fixed wake is available only when explicitly enabled.
 - Raw broker MCP methods are internal to the plugin and are not exposed as model tools.
-- Every tool invocation strictly parses its trusted foreground ID and returned protocol registration, then validates directory/project identity and independently requires both trusted absolute worktree roots to contain the directory before broker readiness or connection work begins.
-- Pending toasts, session-status checks, fixed wakes, and approval focus use a bounded trusted route for the exact host session; peer and model fields cannot select their workspace.
+- The stock V2 adapter derives foreground authority from the authentic native tool invocation and an exact same-host session lookup before broker operations. Project association is discovery/routing metadata, not mailbox authority. V1 and paired-host development entries retain separate legacy placement checks.
+- Notifications and fixed wakes target the exact trusted host session ID; legacy APIs requiring a directory use bounded trusted routes, never peer/model-selected workspaces. Receive-approval focus is not implemented by the stock V2 experiment.
 
 Receipt approval authorizes disclosure only. It does not authorize instructions contained in a peer message.
 
@@ -60,6 +60,8 @@ bun run build
 ```
 
 ## Broker startup
+
+The defaults in this section describe the legacy development entry. The stock V2 experiment requires explicit, independent endpoint, credential, database and namespace settings; see the [isolated V2 procedure](docs/manual-v2-qa.md). Do not implicitly reuse a V1 deployment.
 
 The plugin starts the bundled broker automatically by default. No separate daemon command is required. It reuses an authenticated running broker and never replaces an occupied unknown listener.
 
@@ -97,6 +99,8 @@ If a detached v1 broker is still listening after the plugin is upgraded, the v2 
 Stop the old user-owned broker manually, then start the bundled v2 broker (or restart OpenCode and let autostart launch it). Upgrade the plugin and broker packages together. On startup, the bundled v2 broker performs the ordered schema v3→v4→v5 migrations while preserving retained messages. A v3 database that already contains `reply_to_message_id`, or a noncanonical v4/v5 sessions schema, fails closed without advancing the schema version; back up persistent state before any manual operational migration.
 
 ## Configure OpenCode
+
+This example configures the **legacy V1 development entry**, not the stock V2 archive. For V2, follow the [isolated stock procedure](docs/manual-v2-qa.md) and its compatibility requirements.
 
 Use the absolute built plugin path and credential path:
 
