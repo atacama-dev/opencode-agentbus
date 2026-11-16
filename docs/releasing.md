@@ -67,6 +67,14 @@ The [V2 integration status](https://github.com/atacama-dev/opencode-agentbus/blo
 
 ## Rollout, when everything is ready
 
+### Initial V1 0.1.0 bootstrap
+
+The maintainer authorized the first V1 `0.1.0` publication on 2026-11-16, explicitly accepting the [deferred fresh manual native-host checks](qa.md#initial-v1-010-release-decision). V1 readiness/publication switches record that release decision, not a claim that those checks passed; V2 readiness stays false.
+
+npm requires an existing package before trusted publishing can be configured. For this first real package only, the approved bootstrap is an interactive publication of the **exact archive downloaded from a fully successful CI run on the protected annotated release tag**, with lifecycle scripts disabled. Verify its source commit, manifest, archive hash and installed-audit decision before publishing, then verify registry SHA-512 integrity. Do not publish a placeholder or use a permanent write token. This initial publication has **no OIDC provenance** and must not be described as trusted-published.
+
+Publish the GitHub release on that same tag only after the registry integrity matches. The unchanged release workflow must recognize the existing identical npm version and attach verified assets without another npm publication; any byte mismatch stops the workflow. Configure trusted publishing when a subsequent real publication is ready, accounting for npm's two-day first-use deadline. This one-time bootstrap does not add a token fallback or relax subsequent publication checks.
+
 ### 1. Release V1 from `main`
 
 Integrate and review the main-based V1 preparation first. Check that its release line is `v1`, its package name and version are correct, and its gates pass on that exact source.
