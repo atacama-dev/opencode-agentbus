@@ -10,7 +10,9 @@ Original messaging flow approved on 2026-08-20. Plugin-managed broker lifecycle 
 
 On 2026-11-16, the maintainer authorized publishing V1 `0.1.0` using the existing historical native evidence and current automated/installed-archive checks, without repeating manual native-host acceptance. The maintainer no longer has the V1 test setup and accepts evaluating subsequent reports. The attached-client wake/focus, routing and approval observations below remain **unrun on the current release source**, not passed or certified. This decision does not change native permission enforcement or authorize a V2 release.
 
-The initial npm publication bootstraps the real, exact tagged CI-tested archive through interactive authentication; it is **not an OIDC-provenance publication**. The normal guarded OIDC publisher remains unchanged. See the [one-time bootstrap boundary](releasing.md#initial-v1-010-bootstrap).
+The initial npm publication bootstrapped the real, exact tagged CI-tested archive through interactive authentication; it is **not an OIDC-provenance publication**. The historical workflow's npm version probe failed before publication, and verified matching GitHub assets were recovered separately without another npm write. The normal guarded publisher now includes a mainline npm-config fix for future releases; it does not repair the immutable V1 tag. See the [one-time bootstrap boundary](releasing.md#initial-v1-010-bootstrap).
+
+V1 readiness records that historical release only. V2 readiness remains false and publication remains disabled. The [V2 integration status](v2-port.md) and [manual V2 procedure](manual-v2-qa.md) record unresolved native cross-project `always`, uncertain wake recovery, discovery and threat-model acceptance gates; packaging and deterministic tests do not certify them.
 
 ### Historical automated baseline
 
