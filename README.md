@@ -11,7 +11,7 @@ The system combines:
 
 Status: implemented and end-to-end QA-validated on Linux with Bun 1.3.9 and OpenCode 1.18.19. Built integration tests cover server-root/attached-workspace behavior through a simulated OpenCode host API, and compatibility tests cover the session-status map shape observed on the currently installed OpenCode 1.18.23 runtime. The opt-in real `opencode-server` attached-client wake, TUI navigation, and approval-flow gate remains outstanding.
 
-[Installable V1 archives and release automation](docs/releasing.md) are prepared and tested; publication remains disabled pending the separate release gates. Dependency findings remain visible under an [expiring risk-acceptance policy](docs/dependency-exceptions.md), not a clean-audit claim.
+[Installable V1 archives and release automation](docs/releasing.md) are prepared and tested. V1 `0.1.0` is selected for the initial release; the maintainer has accepted deferring fresh manual native-host acceptance, as recorded in [QA evidence](docs/qa.md#initial-v1-010-release-decision). This is not a claim that the outstanding native tests passed. Dependency findings remain visible under an [expiring risk-acceptance policy](docs/dependency-exceptions.md), not a clean-audit claim.
 
 ## Security model
 
