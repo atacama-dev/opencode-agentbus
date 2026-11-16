@@ -122,6 +122,8 @@ Automated coverage validates:
 
 ## Bounded foreground admission
 
+Broker capacity and displacement proofs apply to the shared protocol. The `ToolContext` directory/project/worktree checks and routed UI observations below are **legacy-adapter evidence**, not stock V2 authorization requirements. The stock V2 path resolves the authentic native invocation's exact session through the same-host API; project association is discovery metadata and does not establish foreground authority. See the [V2 integration status](v2-port.md) for its separate acceptance limits.
+
 Automated coverage validates:
 
 - 300 sessions aggregate across two independently instantiated built plugin/workspace clients sharing one authenticated broker principal, with all 300 active and none displaced;
