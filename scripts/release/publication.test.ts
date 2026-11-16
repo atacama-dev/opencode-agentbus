@@ -1,11 +1,16 @@
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type PackageArtifact, parseReleaseConfig, readReleaseConfig } from "./config";
 import {
   type PublicationIO,
   assertTrustedPublishingVersions,
   compareReleaseVersions,
   npmEnvironment,
+  prepareNpmConfig,
   publishRelease,
   trustedRuntimePaths,
   versionAtLeast,
@@ -139,7 +144,59 @@ test("version probes have no ambient authority; only trusted publication gets OI
   }
 });
 
-function fixture(version = "0.1.0", line: "v1" | "v2" = "v2") {
+test("real npm version probe accepts the same isolated config flags as publication", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "agentbus-npm-config-test-"));
+  try {
+    prepareNpmConfig(cwd);
+    const { input, io, state } = fixture("0.1.0", "v2", cwd);
+    await publishRelease(input, io);
+    const flags = state.publishCalls[0]?.filter((arg) =>
+      /^--(?:userconfig|globalconfig)=/u.test(arg),
+    );
+    expect(flags).toHaveLength(2);
+    const nodePath = Bun.which("node");
+    const npmPath = Bun.which("npm");
+    if (!nodePath || !npmPath || !flags) throw new Error("Installed Node/npm required.");
+    const node = realpathSync(nodePath);
+    const npm = realpathSync(npmPath);
+    const env = npmEnvironment(
+      { NPM_CONFIG_USERCONFIG: "/untrusted/user", NPM_CONFIG_GLOBALCONFIG: "/untrusted/global" },
+      node,
+      cwd,
+      false,
+    );
+    const user = flags?.find((flag) => flag.startsWith("--userconfig="))?.slice(13);
+    const global = flags?.find((flag) => flag.startsWith("--globalconfig="))?.slice(15);
+    if (!user || !global) throw new Error("Both npm config flags required.");
+    for (const [args, configEnv] of [
+      [[npm, "--version"], env],
+      [
+        [npm, "--version", ...flags],
+        { ...env, NPM_CONFIG_USERCONFIG: undefined, NPM_CONFIG_GLOBALCONFIG: undefined },
+      ],
+      [[npm, "--version", ...flags], env],
+    ] as const)
+      expect(
+        execFileSync(node, args, {
+          cwd,
+          env: configEnv,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim(),
+      ).toMatch(/^[0-9]+\.[0-9]+\.[0-9]+$/u);
+    expect(env.NPM_CONFIG_USERCONFIG).toBe(user);
+    expect(env.NPM_CONFIG_GLOBALCONFIG).toBe(global);
+    expect(user).not.toBe(global);
+    expect(global.startsWith(`${cwd}/`)).toBe(true);
+    expect(lstatSync(global).isFile()).toBe(true);
+    expect(readFileSync(global, "utf8")).toBe("");
+    expect(lstatSync(global).mode & 0o777).toBe(0o600);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+function fixture(version = "0.1.0", line: "v1" | "v2" = "v2", npmConfigDir = "/isolated") {
   const config = parseReleaseConfig({
     ...readReleaseConfig(),
     releaseLine: line,
@@ -202,6 +259,7 @@ function fixture(version = "0.1.0", line: "v1" | "v2" = "v2") {
   };
   const response = (value: unknown, status = 200) => Response.json(value, { status });
   const io: PublicationIO = {
+    npmConfigDir,
     github: async (url, init) => {
       if (init?.method === "POST") {
         state.writes.push(url);
@@ -298,7 +356,7 @@ test("publication uses exact tgz, OIDC-compatible CLI flags and existing release
     "--provenance",
     "--registry=https://registry.npmjs.org",
     "--userconfig=/dev/null",
-    "--globalconfig=/dev/null",
+    "--globalconfig=/isolated/.npmrc-global",
   ]);
   expect([...state.assets.keys()]).toEqual([
     "agentbus.tgz",
