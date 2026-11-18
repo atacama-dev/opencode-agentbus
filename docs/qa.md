@@ -12,7 +12,13 @@ On 2026-11-16, the maintainer authorized publishing V1 `0.1.0` using the existin
 
 The initial npm publication bootstrapped the real, exact tagged CI-tested archive through interactive authentication; it is **not an OIDC-provenance publication**. The historical workflow's npm version probe failed before publication, and verified matching GitHub assets were recovered separately without another npm write. The normal guarded publisher now includes a mainline npm-config fix for future releases; it does not repair the immutable V1 tag. See the [one-time bootstrap boundary](releasing.md#initial-v1-010-bootstrap).
 
-V1 readiness records that historical release only. V2 readiness remains false and publication remains disabled. The [V2 integration status](v2-port.md) and [manual V2 procedure](manual-v2-qa.md) record unresolved native cross-project `always`, uncertain wake recovery, discovery and threat-model acceptance gates; packaging and deterministic tests do not certify them.
+V1 readiness records that historical release only; the separate V2 decision follows.
+
+### Initial V2 0.1.0 release decision
+
+On 2026-11-18, the maintainer reported that the installed V2 package works in manual testing on a real host and explicitly authorized the V2 `0.1.0` tag, GitHub release and npm publication. This is **maintainer-reported functional acceptance**, not a newly executed automated test or a recorded pass for every item in the [manual V2 procedure](manual-v2-qa.md). No additional scenario coverage is inferred from that report.
+
+`release.config.json` now records V2 readiness and enables publication. The adapter remains experimental with the [documented limits](v2-port.md), including native cross-project `always`, uncertain wake recovery, discovery and threat-model coverage. Those gaps are retained for this experimental release, not declared fixed or individually validated. Tagged-source CI, exact-archive checks and the expiring dependency-exception policy remain required before distribution; this decision does not itself mean publication has occurred.
 
 ### Historical automated baseline
 

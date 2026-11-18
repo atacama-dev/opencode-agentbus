@@ -1,6 +1,6 @@
 # Release preparation and the OpenCode V1 → V2 transition
 
-V1 `0.1.0` has been published from protected tag `opencode-v1/v0.1.0` and preserved on `maintenance/opencode-v1`. This procedure keeps that released line available while preparing a separate OpenCode V2 source. It separates building a package from authorizing its distribution. **Preparing V2 does not authorize a V2 release, tag or npm publication.**
+V1 `0.1.0` has been published from protected tag `opencode-v1/v0.1.0` and preserved on `maintenance/opencode-v1`. This procedure keeps that released line available while preparing a separate OpenCode V2 source. Building a package does not authorize its distribution. The maintainer has separately authorized the experimental V2 `0.1.0` tag, GitHub release and npm publication; see the [release decision](qa.md#initial-v2-010-release-decision). Publication still requires the checks below.
 
 The host generations called **V1/V2** here are different from Agent Bus's application protocol v2, which both adapters use.
 
@@ -61,7 +61,7 @@ All of the following are owner-controlled prerequisites, not actions the workflo
 3. Configure required review for the publication environments and protect `main`, the maintenance branches and both release-tag prefixes against unauthorized changes. **An annotated tag alone is not immutable**: repository rules must prevent moving or deleting accepted release tags.
 4. Verify the repository remains public. OIDC publishing itself can work from private repositories, but npm's automatic public provenance cannot. Our public-publication policy requires a public repository; preparation must not change visibility automatically.
 5. Resolve all uncovered production findings and complete the line-specific functional/security gates. Temporary acceptance is limited to the exact advisory/version/chain entries and dates in the reviewed exception ledger; it is not a clean dependency audit. Review the actual production install of each package separately and re-evaluate the policy at publication time.
-6. Record the reviewed version and explicitly mark the selected line ready in `release.config.json`; enable npm publication only after external setup and owner review. In the V2 integration candidate, V1 readiness is true as historical release state; V2 readiness and publication are false.
+6. Record the reviewed version and explicitly mark the selected line ready in `release.config.json`; enable npm publication only after external setup and owner review. For the authorized experimental V2 `0.1.0` release, V2 readiness and publication are enabled; V1 readiness remains historical release state. These switches do not bypass any tagged-source, artifact, audit or publication-environment check.
 
 The [V2 integration status](v2-port.md) and [manual V2 procedure](manual-v2-qa.md) record its limitations and native-host acceptance gaps. The V1 [QA record](qa.md) remains applicable to its own source; do not copy a V2 test result to qualify a V1 backport.
 
@@ -69,7 +69,7 @@ The [V2 integration status](v2-port.md) and [manual V2 procedure](manual-v2-qa.m
 
 ### Initial V1 0.1.0 bootstrap
 
-The maintainer authorized and completed the first V1 `0.1.0` publication on 2026-11-16, explicitly accepting the [deferred fresh manual native-host checks](qa.md#initial-v1-010-release-decision). The V1 release-source readiness/publication switches record that historical decision, not a claim that those checks passed; V2 readiness stays false.
+The maintainer authorized and completed the first V1 `0.1.0` publication on 2026-11-16, explicitly accepting the [deferred fresh manual native-host checks](qa.md#initial-v1-010-release-decision). The V1 release-source readiness/publication switches record that historical decision, not a claim that those checks passed; V2 has its own separate release decision.
 
 npm required an existing package before trusted publishing could be configured. For V1's first real package only, the approved bootstrap interactively published the **exact archive downloaded from a fully successful CI run on the protected annotated release tag**, with lifecycle scripts disabled. Its source commit, manifest, archive hash and installed-audit decision were verified before publication, then registry SHA-512 integrity was verified. No placeholder was deliberately published, and no permanent npm token was added to CI. This initial publication has **no OIDC provenance** and must not be described as trusted-published.
 
@@ -87,9 +87,9 @@ The workflow builds/verifies the tagged source, not whatever `main` happens to c
 
 The protected tag retains the exact V1 release commit. `maintenance/opencode-v1` preserves the final V1 source tree, including the later logo and npm-config publication correction; its active release line remains `v1`. Subsequent V1 fixes belong on this branch, without changing the accepted release tag or importing V2 runtime dependencies.
 
-### 3. Integrate V2 into `main` (pending review)
+### 3. Integrate V2 into `main` (completed)
 
-Review the integration candidate against the V1-released `main`, including its shared security/build backports. Do not blindly merge duplicated backports or rewrite an already-published branch history. Only after that review and merge will `main` select `v2` and the V2 package; the frozen V1 tag remains unchanged.
+The reviewed V2 integration is on `main`, including its shared security/build backports. `main` selects `v2` and the V2 package; the frozen V1 tag remains unchanged. Do not blindly merge duplicated backports or rewrite an already-published branch history.
 
 ### 4. Release and preserve V2
 
