@@ -69,6 +69,8 @@ The [V2 integration status](v2-port.md) and [manual V2 procedure](manual-v2-qa.m
 
 ### Initial V1 0.1.0 bootstrap
 
+The same first-package boundary applies to the authorized V2 `0.1.0` release: before triggering its publication workflow, interactively publish only the exact archive from successful CI on the protected annotated V2 tag, with lifecycle scripts disabled. Verify the tagged source, manifest, SHA-256, installed-audit decision and registry SHA-512 integrity. Configure the V2 trusted publisher once the real package exists; no placeholder, permanent CI token or OIDC-provenance claim is permitted for this bootstrap.
+
 The maintainer authorized and completed the first V1 `0.1.0` publication on 2026-11-16, explicitly accepting the [deferred fresh manual native-host checks](qa.md#initial-v1-010-release-decision). The V1 release-source readiness/publication switches record that historical decision, not a claim that those checks passed; V2 has its own separate release decision.
 
 npm required an existing package before trusted publishing could be configured. For V1's first real package only, the approved bootstrap interactively published the **exact archive downloaded from a fully successful CI run on the protected annotated release tag**, with lifecycle scripts disabled. Its source commit, manifest, archive hash and installed-audit decision were verified before publication, then registry SHA-512 integrity was verified. No placeholder was deliberately published, and no permanent npm token was added to CI. This initial publication has **no OIDC provenance** and must not be described as trusted-published.
