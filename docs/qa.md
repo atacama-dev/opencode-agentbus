@@ -20,6 +20,8 @@ On 2026-11-18, the maintainer reported that the installed V2 package works in ma
 
 `release.config.json` now records V2 readiness and enables publication. The adapter remains experimental with the [documented limits](v2-port.md), including native cross-project `always`, uncertain wake recovery, discovery and threat-model coverage. Those gaps are retained for this experimental release, not declared fixed or individually validated. Tagged-source CI, exact-archive checks and the expiring dependency-exception policy remain required before distribution; this decision does not itself mean publication has occurred.
 
+On 2026-11-18, the database-file security suite also passed as UID 0 in an isolated local container: 10 tests, no skips, including rejection of an existing database owned by another user. The container had no network, a read-only source mount and root filesystem, a temporary writable filesystem, and only `CHOWN` and `DAC_OVERRIDE` capabilities. This closes the root-only test gap for this release; it is local security evidence, not a claim that ordinary CI runs that test.
+
 ### Historical automated baseline
 
 This section records the historical baseline, not a clean audit of the current dependencies. Current dependency findings and the temporary acceptance criteria are documented in [dependency exceptions](dependency-exceptions.md); a passing policy does not remove those findings.
@@ -200,7 +202,7 @@ This increment introduces no new TUI permission flow: `agentbus_reply` does not 
 
 ## Remaining release gates
 
-- Run the root-only wrong-owner database-file test in privileged security CI before public release.
+- Keep the root-only wrong-owner database-file test in privileged security verification; the V2 `0.1.0` local isolated-container result is recorded above.
 - Run the opt-in real OpenCode server gate below. It changes the selected test server's configuration, may require a restart, and sends live messages, so it is not part of deterministic automation and has not been run in this increment.
 
 ## Opt-in real OpenCode server gate
