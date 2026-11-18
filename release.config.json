@@ -7,6 +7,6 @@
     "v1": "@atacama-dev/opencode-agentbus-v1",
     "v2": "@atacama-dev/opencode-agentbus-v2"
   },
-  "readiness": { "v1": true, "v2": false },
-  "publishEnabled": false
+  "readiness": { "v1": true, "v2": true },
+  "publishEnabled": true
 }
